@@ -20,3 +20,8 @@ python -u difusco/train.py \
   --validation_examples 8 \
   --inference_schedule "cosine" \
   --inference_diffusion_steps 50
+  
+tensorboard --logdir=./tb_logs --port=6006 &
+echo "Training completed!"
+echo "启动 Tensorboard 服务..."
+echo "请访问 http://localhost:6006 查看训练进度"
