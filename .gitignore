@@ -1,2 +1,6 @@
 scripts
 .idea
+*.png
+*.gif
+/tb_logs
+*.txt

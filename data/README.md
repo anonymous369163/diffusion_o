@@ -18,7 +18,7 @@ python -u generate_data.py \
   --max_nodes 500 \
   --num_samples 128000 \
   --batch_size 128 \
-  --filename "/your/path/to/tsp500_train_concorde.txt" \
+  --filename "data/tsp/tsp500_train_concorde.txt" \
   --seed 1234
 ```
 
@@ -28,7 +28,7 @@ python -u generate_data.py \
   --max_nodes 1000 \
   --num_samples 64000 \
   --batch_size 128 \
-  --filename "/your/path/to/tsp1000_train_concorde.txt" \
+  --filename "data/tsp/tsp1000_train_concorde.txt" \
   --seed 1234
 ```
 
@@ -38,7 +38,7 @@ python -u generate_data.py \
   --max_nodes 10000 \
   --num_samples 6400 \
   --batch_size 64 \
-  --filename "/your/path/to/tsp10000_train_concorde.txt" \
+  --filename "data/tsp/tsp10000_train_concorde.txt" \
   --seed 1234
 ```
 
