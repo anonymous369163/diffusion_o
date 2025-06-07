@@ -1,9 +1,7 @@
+#!/bin/bash
+
 export PYTHONPATH="$PWD:$PYTHONPATH"
 export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
-
-# shellcheck disable=SC2155
-# export WANDB_RUN_ID=$(python -c "import wandb; print(wandb.util.generate_id())")
-# echo "WANDB_ID is $WANDB_RUN_ID"
 
 python -u difusco/train.py \
   --task "tsp" \
@@ -20,8 +18,13 @@ python -u difusco/train.py \
   --validation_examples 8 \
   --inference_schedule "cosine" \
   --inference_diffusion_steps 50
-  
+
+# 检查tensorboard是否已在运行，如果是则停止
+pkill -f "tensorboard.*port=6006" 2>/dev/null
+
+# 启动tensorboard
 tensorboard --logdir=./tb_logs --port=6006 &
+
 echo "Training completed!"
 echo "启动 Tensorboard 服务..."
 echo "请访问 http://localhost:6006 查看训练进度"

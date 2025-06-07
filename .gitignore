@@ -4,3 +4,8 @@ scripts
 *.gif
 /tb_logs
 *.txt
+*.pyc
+*.Identifier
+*.pyc
+/mtnco
+/saved_models

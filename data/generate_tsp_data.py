@@ -12,6 +12,29 @@ from concorde.tsp import TSPSolver  # https://github.com/jvkersch/pyconcorde
 
 warnings.filterwarnings("ignore")
 
+def solve_tsp(nodes_coord):
+  if opts.solver == "concorde":
+    scale = 1e6
+    solver = TSPSolver.from_data(nodes_coord[:, 0] * scale, nodes_coord[:, 1] * scale, norm="EUC_2D")
+    solution = solver.solve(verbose=False)
+    tour = solution.tour
+  elif opts.solver == "lkh":
+    scale = 1e6
+    lkh_path = 'LKH-3.0.6/LKH'
+    problem = tsplib95.models.StandardProblem()
+    problem.name = 'TSP'
+    problem.type = 'TSP'
+    problem.dimension = num_nodes
+    problem.edge_weight_type = 'EUC_2D'
+    problem.node_coords = {n + 1: nodes_coord[n] * scale for n in range(num_nodes)}
+
+    solution = lkh.solve(lkh_path, problem=problem, max_trials=opts.lkh_trails, runs=10)
+    tour = [n - 1 for n in solution[0]]
+  else:
+    raise ValueError(f"Unknown solver: {opts.solver}")
+
+  return tour
+
 
 if __name__ == "__main__":
   parser = argparse.ArgumentParser()
@@ -42,29 +65,6 @@ if __name__ == "__main__":
       assert opts.min_nodes <= num_nodes <= opts.max_nodes
 
       batch_nodes_coord = np.random.random([opts.batch_size, num_nodes, 2])
-
-      def solve_tsp(nodes_coord):
-        if opts.solver == "concorde":
-          scale = 1e6
-          solver = TSPSolver.from_data(nodes_coord[:, 0] * scale, nodes_coord[:, 1] * scale, norm="EUC_2D")
-          solution = solver.solve(verbose=False)
-          tour = solution.tour
-        elif opts.solver == "lkh":
-          scale = 1e6
-          lkh_path = 'LKH-3.0.6/LKH'
-          problem = tsplib95.models.StandardProblem()
-          problem.name = 'TSP'
-          problem.type = 'TSP'
-          problem.dimension = num_nodes
-          problem.edge_weight_type = 'EUC_2D'
-          problem.node_coords = {n + 1: nodes_coord[n] * scale for n in range(num_nodes)}
-
-          solution = lkh.solve(lkh_path, problem=problem, max_trials=opts.lkh_trails, runs=10)
-          tour = [n - 1 for n in solution[0]]
-        else:
-          raise ValueError(f"Unknown solver: {opts.solver}")
-
-        return tour
 
       with Pool(opts.batch_size) as p:
         tours = p.map(solve_tsp, [batch_nodes_coord[idx] for idx in range(opts.batch_size)])
