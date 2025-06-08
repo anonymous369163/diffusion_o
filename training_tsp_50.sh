@@ -21,7 +21,7 @@ python -u difusco/train.py \
   --inference_schedule "cosine" \
   --inference_diffusion_steps 50
   
-tensorboard --logdir=./tb_logs --port=6006 &
+tensorboard --logdir=./tb_logs &
 echo "Training completed!"
 echo "启动 Tensorboard 服务..."
 echo "请访问 http://localhost:6006 查看训练进度"
