@@ -9,3 +9,4 @@ scripts
 *.pyc
 /mtnco
 /saved_models
+/runs
