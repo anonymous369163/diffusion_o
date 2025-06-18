@@ -36,6 +36,18 @@ class MISModel(COMetaModel):
     self.validation_dataset = MISDataset(
         data_file=os.path.join(self.args.storage_path, self.args.validation_split),
     )
+    
+    # 为MIS任务添加特定的超参数记录
+    mis_specific_params = {
+        'training_split_label_dir': self.args.training_split_label_dir,
+        'node_feature_only': True,  # MIS模型使用节点特征
+    }
+    
+    # 更新超参数记录
+    if hasattr(self, 'hparams') and isinstance(self.hparams, dict):
+        self.hparams.update(mis_specific_params)
+    else:
+        self.save_hyperparameters(mis_specific_params)
 
   def forward(self, x, t, edge_index):
     return self.model(x, t, edge_index=edge_index)
@@ -71,7 +83,16 @@ class MISModel(COMetaModel):
 
     loss_func = nn.CrossEntropyLoss()
     loss = loss_func(x0_pred, node_labels)
-    self.log("train/loss", loss)
+    
+    # 记录分类扩散的训练信息
+    self.log("train/ce_loss", loss, on_step=True, on_epoch=True)
+    self.log("train/batch_idx", float(batch_idx), on_step=True, on_epoch=False)
+    self.log("train/batch_size", float(point_indicator.shape[0]), on_step=True, on_epoch=False)
+    
+    # 记录扩散时间步信息
+    avg_t = np.mean(np.random.randint(1, self.diffusion.T + 1, point_indicator.shape[0]).astype(int))
+    self.log("train/avg_diffusion_timestep", avg_t, on_step=True, on_epoch=True)
+    
     return loss
 
   def gaussian_training_step(self, batch, batch_idx):
@@ -106,7 +127,16 @@ class MISModel(COMetaModel):
 
     # Compute loss
     loss = F.mse_loss(epsilon_pred, epsilon.float())
-    self.log("train/loss", loss)
+    
+    # 记录高斯扩散的训练信息
+    self.log("train/mse_loss", loss, on_step=True, on_epoch=True)
+    self.log("train/batch_idx", float(batch_idx), on_step=True, on_epoch=False)
+    self.log("train/batch_size", float(point_indicator.shape[0]), on_step=True, on_epoch=False)
+    
+    # 记录扩散时间步信息
+    avg_t = np.mean(np.random.randint(1, self.diffusion.T + 1, point_indicator.shape[0]).astype(int))
+    self.log("train/avg_diffusion_timestep", avg_t, on_step=True, on_epoch=True)
+    
     return loss
 
   def training_step(self, batch, batch_idx):
@@ -200,12 +230,30 @@ class MISModel(COMetaModel):
     best_solved_cost = np.max(solved_costs)
 
     gt_cost = node_labels.cpu().numpy().sum()
+    
+    # 计算额外的性能指标
+    gap_percentage = ((best_solved_cost - gt_cost) / gt_cost) * 100 if gt_cost > 0 else 0
+    avg_solved_cost = np.mean(solved_costs)
+    std_solved_cost = np.std(solved_costs)
+    
     metrics = {
         f"{split}/gt_cost": gt_cost,
+        f"{split}/solved_cost": best_solved_cost,
+        f"{split}/avg_solved_cost": avg_solved_cost,
+        f"{split}/std_solved_cost": std_solved_cost,
+        f"{split}/gap_percentage": gap_percentage,
+        f"{split}/total_sampling": all_sampling,
+        f"{split}/sequential_sampling": self.args.sequential_sampling,
+        f"{split}/parallel_sampling": self.args.parallel_sampling,
+        f"{split}/num_nodes": len(node_labels),
     }
+    
     for k, v in metrics.items():
       self.log(k, v, on_epoch=True, sync_dist=True)
+    
+    # 特别标记最重要的指标用于进度条显示
     self.log(f"{split}/solved_cost", best_solved_cost, prog_bar=True, on_epoch=True, sync_dist=True)
+    
     return metrics
 
   def validation_step(self, batch, batch_idx):

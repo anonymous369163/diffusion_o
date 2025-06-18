@@ -24,6 +24,52 @@ class COMetaModel(pl.LightningModule):
     self.diffusion_steps = self.args.diffusion_steps
     self.sparse = self.args.sparse_factor > 0 or node_feature_only
 
+    # 保存重要的超参数到tensorboard
+    hyperparams_to_save = {
+        # 模型架构参数
+        'n_layers': self.args.n_layers,
+        'hidden_dim': self.args.hidden_dim,
+        'aggregation': self.args.aggregation,
+        'sparse_factor': self.args.sparse_factor,
+        
+        # 训练参数
+        'batch_size': self.args.batch_size,
+        'learning_rate': self.args.learning_rate,
+        'weight_decay': self.args.weight_decay,
+        'lr_scheduler': self.args.lr_scheduler,
+        'num_epochs': self.args.num_epochs,
+        
+        # 扩散模型参数
+        'diffusion_type': self.args.diffusion_type,
+        'diffusion_schedule': self.args.diffusion_schedule,
+        'diffusion_steps': self.args.diffusion_steps,
+        'inference_diffusion_steps': self.args.inference_diffusion_steps,
+        'inference_schedule': self.args.inference_schedule,
+        'inference_trick': self.args.inference_trick,
+        
+        # 采样参数
+        'sequential_sampling': self.args.sequential_sampling,
+        'parallel_sampling': self.args.parallel_sampling,
+        
+        # 其他重要参数
+        'task': self.args.task,
+        'fp16': self.args.fp16,
+        'use_activation_checkpoint': self.args.use_activation_checkpoint,
+        'two_opt_iterations': self.args.two_opt_iterations,
+    }
+    
+    # 添加强化学习相关参数（如果存在）
+    if hasattr(self.args, 'rl_loss_weight'):
+        hyperparams_to_save.update({
+            'rl_loss_weight': self.args.rl_loss_weight,
+            'rl_baseline_decay': self.args.rl_baseline_decay,
+            'rl_compute_frequency': self.args.rl_compute_frequency,
+            'use_pomo': getattr(self.args, 'use_pomo', False),
+        })
+    
+    # 保存超参数
+    self.save_hyperparameters(hyperparams_to_save)
+
     if self.diffusion_type == 'gaussian':
       out_channels = 1
       self.diffusion = GaussianDiffusion(

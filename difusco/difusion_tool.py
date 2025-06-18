@@ -23,43 +23,42 @@ class TSPModel_v2(TSPModel):
     def __init__(self, param_args=None, pro_idx=0):
         super(TSPModel_v2, self).__init__(param_args=param_args)
         self.args = param_args
-
-    def generate_adj(self, points, split='test'):
+    
+    def generate_adjacency_matrix(self, points, steps=None):
         """
-        生成TSP问题的邻接矩阵
+        基于扩散模型生成单个连接概率矩阵
         Args:
-            points: numpy array of shape (batch_size, num_nodes, 2) - 节点坐标
+            points: torch.Tensor - 节点坐标，形状为 (batch_size, num_nodes, 2) 或 (num_nodes, 2)
         Returns:
-            adj_mat: numpy array of shape (batch_size, num_nodes, num_nodes) - 邻接矩阵
+            adj_mat: numpy.ndarray - 单个采样结果的邻接矩阵
         """
         device = next(self.parameters()).device
         
-        # 确保points是正确的格式
-        if isinstance(points, np.ndarray):
-            np_points = points
-        else:
-            np_points = points.cpu().numpy()
-            
-        # 确保是3维数组 (batch_size, num_nodes, 2)
-        if len(np_points.shape) == 2:
-            np_points = np_points[np.newaxis, :, :]
-            
-        batch_size, num_nodes, _ = np_points.shape
-
-        for _ in range(self.args.sequential_sampling):
-            # 初始化随机噪声矩阵
-            xt = torch.randn(batch_size, num_nodes, num_nodes, device=device)
-            
-            if self.args.parallel_sampling > 1:
-                xt = xt.repeat(self.args.parallel_sampling, 1, 1)
-                xt = torch.randn_like(xt)
+        # 确保points在正确的设备上并获取形状信息
+        points = points.to(device)
+        
+        # 处理points的维度，确保是 (batch_size, num_nodes, 2) 格式
+        if len(points.shape) == 2:  # (num_nodes, 2)
+            points = points.unsqueeze(0)  # 添加batch维度 -> (1, num_nodes, 2)
+        
+        batch_size, num_nodes, coord_dim = points.shape 
+        
+        # 根据模型类型构建相应的数据结构  
+        adj_matrix = torch.zeros(batch_size, num_nodes, num_nodes, device=device)
+        edge_index = None 
+        
+        with torch.no_grad():
+            # 初始化噪声
+            xt = torch.randn_like(adj_matrix.float()).to(device)
 
             if self.diffusion_type == 'gaussian':
                 xt.requires_grad = True
             else:
                 xt = (xt > 0).long()
 
-            steps = self.args.inference_diffusion_steps
+            # 扩散时间调度
+            if steps is None:
+                steps = self.args.inference_diffusion_steps
             time_schedule = InferenceSchedule(
                 inference_schedule=self.args.inference_schedule,
                 T=self.diffusion.T, 
@@ -72,26 +71,23 @@ class TSPModel_v2(TSPModel):
                 t1 = np.array([t1]).astype(int)
                 t2 = np.array([t2]).astype(int)
 
-                # t1 = t1.repeat(batch_size)
-                # t2 = t2.repeat(batch_size)
-
-                points_tensor = torch.from_numpy(np_points).float().to(device)
-
                 if self.diffusion_type == 'gaussian':
-                    xt = self.gaussian_denoise_step(points_tensor, xt, t1, device, None, target_t=t2)
+                    xt = self.gaussian_denoise_step(
+                        points, xt, t1, device, edge_index, target_t=t2)
                 else:
-                    xt = self.categorical_denoise_step(points_tensor, xt, t1, device, None, target_t=t2)
+                    xt = self.categorical_denoise_step(
+                        points, xt, t1, device, edge_index, target_t=t2)
 
+            # 获取最终的邻接矩阵
             if self.diffusion_type == 'gaussian':
                 adj_mat = xt.cpu().detach().numpy() * 0.5 + 0.5
             else:
                 adj_mat = xt.float().cpu().detach().numpy() + 1e-6
 
-            if self.args.save_numpy_heatmap:
-                self.run_save_numpy_heatmap(adj_mat, np_points, split)
-                
+            # 处理不同采样情况 
+            adj_mat = adj_mat[0]
+        
         return adj_mat
-
 
 def greedy_tsp_solver(adj_matrix, start_node=0):
     """
@@ -198,8 +194,8 @@ def arg_parser():
     parser.add_argument('--diffusion_type', type=str, default='categorical')  # categorical or gaussian
     parser.add_argument('--diffusion_schedule', type=str, default='cosine') # linear or cosine
     parser.add_argument('--diffusion_steps', type=int, default=1000)
-    parser.add_argument('--inference_diffusion_steps', type=int, default=5)  # 减少推理步数以加快速度  5步保证显存够用
-    parser.add_argument('--inference_schedule', type=str, default='linear')   # linear or cosine
+    parser.add_argument('--inference_diffusion_steps', type=int, default=50)  # 减少推理步数以加快速度  5步保证显存够用
+    parser.add_argument('--inference_schedule', type=str, default='cosine')   # linear or cosine
     parser.add_argument('--inference_trick', type=str, default="ddim")
     parser.add_argument('--sequential_sampling', type=int, default=1)
     parser.add_argument('--parallel_sampling', type=int, default=1)
@@ -218,6 +214,16 @@ def arg_parser():
     parser.add_argument('--do_train', default=False)
     parser.add_argument('--do_test', default=False)
     parser.add_argument('--do_valid_only', default=False)
+    
+    # 强化学习相关参数
+    parser.add_argument('--rl_loss_weight', type=float, default=0.1, 
+                        help='强化学习辅助损失的权重')
+    parser.add_argument('--rl_baseline_decay', type=float, default=0.95,
+                        help='强化学习基线的指数衰减率')
+    parser.add_argument('--rl_compute_frequency', type=int, default=1,
+                        help='每隔多少个batch计算一次强化学习损失')
+    parser.add_argument('--use_pomo', action='store_true', default=True,
+                        help='是否使用POMO（Policy Optimization with Multiple Optima）方法')
     
     args = parser.parse_args()
     return args
@@ -247,6 +253,10 @@ def load_model():
 
 
 if __name__ == '__main__':
+    import sys
+    # 修改当前工作目录为项目根目录
+    current_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    os.chdir(current_dir) 
     # 加载模型
     model = load_model()
     model.eval()
@@ -261,6 +271,14 @@ if __name__ == '__main__':
     
     # 随机采样一批问题进行测试
     import random
+    # 设置随机种子以保证可重复性
+    random_seed = 42
+    random.seed(random_seed)
+    np.random.seed(random_seed)
+    torch.manual_seed(random_seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(random_seed)
+        torch.cuda.manual_seed_all(random_seed)
     batch_indices = random.sample(range(len(test_dataloader)), min(1, len(test_dataloader)))
     print(f"随机选择 {len(batch_indices)} 个测试样例进行求解")
     
@@ -274,137 +292,25 @@ if __name__ == '__main__':
         edge_index = None
         np_edge_index = None
         device = model_device  # 使用模型设备而不是数据设备
-        
-        if not model.sparse:
-            real_batch_idx, points, adj_matrix, gt_tour = batch
-            np_points = points.cpu().numpy()[0]
-            np_gt_tour = gt_tour.cpu().numpy()[0]
-            # 强制迁移到模型设备
-            points = points.to(device)
-            adj_matrix = adj_matrix.to(device)
-        else:
-            real_batch_idx, graph_data, point_indicator, edge_indicator, gt_tour = batch
-            route_edge_flags = graph_data.edge_attr
-            points = graph_data.x
-            edge_index = graph_data.edge_index
-            num_edges = edge_index.shape[1]
-            batch_size = point_indicator.shape[0]
-            adj_matrix = route_edge_flags.reshape((batch_size, num_edges // batch_size))
-            points = points.reshape((-1, 2))
-            edge_index = edge_index.reshape((2, -1))
-            np_points = points.cpu().numpy()
-            np_gt_tour = gt_tour.cpu().numpy().reshape(-1)
-            np_edge_index = edge_index.cpu().numpy()
-            # 强制迁移到模型设备
-            points = points.to(device)
-            adj_matrix = adj_matrix.to(device)
-            if edge_index is not None:
-                edge_index = edge_index.to(device)
+
+        real_batch_idx, points, adj_matrix, gt_tour = batch
+        np_points = points.cpu().numpy()[0]
+        np_gt_tour = gt_tour.cpu().numpy()[0]
+        # 强制迁移到模型设备
+        points = points.to(device)
+        adj_matrix = adj_matrix.to(device)
         
         print(f"节点数量: {len(np_points)}")
         print(f"真实最优路径: {np_gt_tour}")
         
-        # 进行扩散求解 (仿照test_step的扩散部分)
+        # 进行扩散求解 - 多次sequential_sampling
         stacked_tours = []
+        for _ in range(model.args.sequential_sampling):
+            adj_mat = model.generate_adjacency_matrix(points, steps=1)
+            stacked_tours.append(adj_mat)
         
-        with torch.no_grad():
-            for _ in range(model.args.sequential_sampling):
-                # 初始化噪声 - 确保在正确的设备上
-                xt = torch.randn_like(adj_matrix.float()).to(device)
-                
-                # 确保points在正确的设备上
-                if not model.sparse:
-                    points = points.to(device)
-                else:
-                    points = points.to(device)
-                    if edge_index is not None:
-                        edge_index = edge_index.to(device)
-                
-                if model.args.parallel_sampling > 1:
-                    if not model.sparse:
-                        xt = xt.repeat(model.args.parallel_sampling, 1, 1)
-                        points = points.repeat(model.args.parallel_sampling, 1, 1)
-                    else:
-                        xt = xt.repeat(model.args.parallel_sampling, 1)
-                        points = points.repeat(model.args.parallel_sampling, 1)
-                        edge_index = model.duplicate_edge_index(edge_index, np_points.shape[0], device)
-                    xt = torch.randn_like(xt).to(device)
-
-                if model.diffusion_type == 'gaussian':
-                    xt.requires_grad = True
-                else:
-                    xt = (xt > 0).long()
-
-                if model.sparse:
-                    xt = xt.reshape(-1)
-
-                # 扩散时间调度
-                steps = model.args.inference_diffusion_steps
-                time_schedule = InferenceSchedule(
-                    inference_schedule=model.args.inference_schedule,
-                    T=model.diffusion.T, 
-                    inference_T=steps
-                )
-
-                # 扩散迭代 (仿照test_step的扩散循环)
-                for i in range(steps):
-                    t1, t2 = time_schedule(i)
-                    t1 = np.array([t1]).astype(int)
-                    t2 = np.array([t2]).astype(int)
-
-                    if model.diffusion_type == 'gaussian':
-                        xt = model.gaussian_denoise_step(
-                            points, xt, t1, device, edge_index, target_t=t2)
-                    else:
-                        xt = model.categorical_denoise_step(
-                            points, xt, t1, device, edge_index, target_t=t2)
-
-                # 获取最终的邻接矩阵
-                if model.diffusion_type == 'gaussian':
-                    adj_mat = xt.cpu().detach().numpy() * 0.5 + 0.5
-                else:
-                    adj_mat = xt.float().cpu().detach().numpy() + 1e-6
-
-                # 处理不同采样情况
-                if len(adj_mat.shape) == 3:
-                    # 批次数据，取第一个实例（因为测试时batch_size=1）
-                    adj_mat = adj_mat[0]
-                elif model.args.parallel_sampling > 1:
-                    # 处理并行采样 - 评估所有采样结果，选择最优的
-                    adj_mat = adj_mat.reshape(model.args.parallel_sampling, 
-                                            len(np_points), len(np_points))
-                    
-                    # 为每个采样结果找到最优解
-                    sampling_results = []
-                    distance_matrix = calculate_euclidean_distance(np_points)
-                    
-                    for sample_idx in range(model.args.parallel_sampling):
-                        sample_adj_mat = adj_mat[sample_idx]
-                        sample_best_cost = float('inf')
-                        sample_best_tour = None
-                        
-                        # 对当前采样结果尝试多个起始点
-                        for start_node in range(min(len(np_points), 5)):
-                            tour, _ = greedy_tsp_solver(sample_adj_mat, start_node)
-                            real_cost = calculate_tour_cost(tour, distance_matrix)
-                            
-                            if real_cost < sample_best_cost:
-                                sample_best_cost = real_cost
-                                sample_best_tour = tour
-                        
-                        sampling_results.append((sample_best_cost, sample_best_tour, sample_adj_mat))
-                    
-                    # 选择最优的采样结果
-                    best_sampling_result = min(sampling_results, key=lambda x: x[0])
-                    adj_mat = best_sampling_result[2]  # 使用最优采样的邻接矩阵
-                    print(f"并行采样结果: {len(sampling_results)} 个采样，最优成本: {best_sampling_result[0]:.4f}")
-                
-                # 将当前采样的adj_mat添加到列表中，用于后续可能的sequential_sampling处理
-                stacked_tours.append(adj_mat)
-        
-        print(f"生成的邻接矩阵形状: {adj_mat.shape}")
-        print(f"邻接矩阵样例 (前5x5):")
-        print(adj_mat[:5, :5])
+        # 获取最后一个采样结果用于显示
+        adj_mat = stacked_tours[-1] if stacked_tours else None
         
         # 对所有采样结果进行评估，选择最优的
         print(f"开始使用贪婪求解器求解...")

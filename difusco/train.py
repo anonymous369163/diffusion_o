@@ -10,9 +10,36 @@ from pytorch_lightning.callbacks.progress import TQDMProgressBar
 from pytorch_lightning.loggers import TensorBoardLogger
 from pytorch_lightning.strategies.ddp import DDPStrategy
 from pytorch_lightning.utilities import rank_zero_info
+import pytorch_lightning as pl
 
 from pl_tsp_model import TSPModel
 from pl_mis_model import MISModel
+
+
+class GradientLoggingCallback(pl.Callback):
+    """记录梯度范数等重要训练信息的回调函数"""
+    
+    def on_before_optimizer_step(self, trainer, pl_module, optimizer, optimizer_idx):
+        # 计算梯度范数
+        total_norm = 0
+        param_count = 0
+        for p in pl_module.parameters():
+            if p.grad is not None:
+                param_norm = p.grad.data.norm(2)
+                total_norm += param_norm.item() ** 2
+                param_count += 1
+        total_norm = total_norm ** (1. / 2)
+        
+        # 记录梯度范数
+        if param_count > 0:
+            pl_module.log("train/gradient_norm", total_norm, on_step=True, on_epoch=False)
+            pl_module.log("train/gradient_norm_avg", total_norm / param_count, on_step=True, on_epoch=False)
+    
+    def on_train_epoch_start(self, trainer, pl_module):
+        # 记录当前epoch的学习率
+        if hasattr(trainer.optimizers[0], 'param_groups'):
+            current_lr = trainer.optimizers[0].param_groups[0]['lr']
+            pl_module.log("train/learning_rate", current_lr, on_step=False, on_epoch=True)
 
 
 def arg_parser():
@@ -57,15 +84,24 @@ def arg_parser():
   parser.add_argument('--ckpt_path', type=str, default=None)
   parser.add_argument('--resume_weight_only', action='store_true')
 
-  parser.add_argument('--do_train', default=True)
-  parser.add_argument('--do_test', default=True)
+  parser.add_argument('--do_train', action='store_true')
+  parser.add_argument('--do_test', action='store_true', default=True)
   parser.add_argument('--do_valid_only', action='store_true')
+  parser.add_argument('--rl_compute_frequency', type=int, default=1)
+  parser.add_argument('--use_pomo', action='store_true', default=True)
+  parser.add_argument('--rl_loss_weight', type=float, default=0.01)
+  parser.add_argument('--rl_baseline_decay', type=float, default=0.95)
+  parser.add_argument('--pomo_temperature', type=float, default=1.0)
 
   args = parser.parse_args()
   return args
 
 
 def main(args):
+  import sys
+  # 修改当前工作目录为项目根目录
+  current_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+  os.chdir(current_dir) 
   epochs = args.num_epochs
   project_name = args.project_name
 
@@ -87,6 +123,48 @@ def main(args):
   )
   rank_zero_info(f"Logging to {tb_logger.save_dir}/{tb_logger.name}/{tb_logger.version}")
 
+  # 记录重要的训练信息
+  if rank_zero_info:
+    # 计算模型参数数量
+    total_params = sum(p.numel() for p in model.model.parameters())
+    trainable_params = sum(p.numel() for p in model.model.parameters() if p.requires_grad)
+    
+    # 记录模型和训练信息到tensorboard
+    tb_logger.experiment.add_text("model_info/architecture", str(model.model), 0)
+    tb_logger.experiment.add_scalar("model_info/total_parameters", total_params, 0)
+    tb_logger.experiment.add_scalar("model_info/trainable_parameters", trainable_params, 0)
+    
+    # 记录数据集信息
+    tb_logger.experiment.add_text("dataset_info/training_split", args.training_split, 0)
+    tb_logger.experiment.add_text("dataset_info/validation_split", args.validation_split, 0)
+    tb_logger.experiment.add_text("dataset_info/test_split", args.test_split, 0)
+    
+    # 记录训练配置
+    training_config = f"""
+    Task: {args.task}
+    Batch Size: {args.batch_size}
+    Learning Rate: {args.learning_rate}
+    Weight Decay: {args.weight_decay}
+    LR Scheduler: {args.lr_scheduler}
+    Epochs: {args.num_epochs}
+    FP16: {args.fp16}
+    Use Activation Checkpoint: {args.use_activation_checkpoint}
+    """
+    tb_logger.experiment.add_text("training_config", training_config, 0)
+    
+    # 记录扩散模型配置
+    diffusion_config = f"""
+    Diffusion Type: {args.diffusion_type}
+    Diffusion Schedule: {args.diffusion_schedule}
+    Diffusion Steps: {args.diffusion_steps}
+    Inference Steps: {args.inference_diffusion_steps}
+    Inference Schedule: {args.inference_schedule}
+    Inference Trick: {args.inference_trick}
+    Sequential Sampling: {args.sequential_sampling}
+    Parallel Sampling: {args.parallel_sampling}
+    """
+    tb_logger.experiment.add_text("diffusion_config", diffusion_config, 0)
+
   checkpoint_callback = ModelCheckpoint(
       monitor='val/solved_cost', mode=saving_mode,
       save_top_k=3, save_last=True,
@@ -96,12 +174,13 @@ def main(args):
                            'checkpoints'),
   )
   lr_callback = LearningRateMonitor(logging_interval='step')
+  gradient_callback = GradientLoggingCallback()
 
   trainer = Trainer(
       accelerator="auto",
-      devices=torch.cuda.device_count() if torch.cuda.is_available() else None,
+      devices=torch.cuda.device_count() if torch.cuda.is_available() else None,  
       max_epochs=epochs,
-      callbacks=[TQDMProgressBar(refresh_rate=20), checkpoint_callback, lr_callback],
+      callbacks=[TQDMProgressBar(refresh_rate=20), checkpoint_callback, lr_callback, gradient_callback],
       logger=tb_logger,
       check_val_every_n_epoch=1,
       strategy=DDPStrategy(static_graph=True),
