@@ -28,7 +28,7 @@ python -u difusco/train.py \
   --rl_baseline_decay 0.95 \
   --pomo_temperature 0.5 \
   --do_test \
-  --ckpt_path "./tb_logs/tsp_diffusion/version_9/checkpoints/last.ckpt"
+  --ckpt_path "./tb_logs/tsp_diffusion/version_8/checkpoints/last.ckpt"
 # tensorboard --logdir=./tb_logs &
 # echo "Training completed!"
 # echo "启动 Tensorboard 服务..."
