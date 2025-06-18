@@ -26,10 +26,6 @@ python -u difusco/train.py \
   --use_pomo \
   --rl_loss_weight 0.1 \
   --rl_baseline_decay 0.95 \
-  --pomo_temperature 0.5 \
+  --pomo_temperature 1 \
   --do_test \
   --ckpt_path "./tb_logs/tsp_diffusion/version_8/checkpoints/last.ckpt"
-# tensorboard --logdir=./tb_logs &
-# echo "Training completed!"
-# echo "启动 Tensorboard 服务..."
-# echo "请访问 http://localhost:6006 查看训练进度"

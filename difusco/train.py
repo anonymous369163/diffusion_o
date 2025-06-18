@@ -67,7 +67,7 @@ def arg_parser():
   parser.add_argument('--diffusion_schedule', type=str, default='cosine')
   parser.add_argument('--diffusion_steps', type=int, default=1000) 
   parser.add_argument('--inference_diffusion_steps', type=int, default=50)  # o:1k
-  parser.add_argument('--inference_schedule', type=str, default='linear')
+  parser.add_argument('--inference_schedule', type=str, default='cosine')
   parser.add_argument('--inference_trick', type=str, default="ddim")
   parser.add_argument('--sequential_sampling', type=int, default=1)
   parser.add_argument('--parallel_sampling', type=int, default=1)
@@ -84,7 +84,7 @@ def arg_parser():
   parser.add_argument('--ckpt_path', type=str, default=None)
   parser.add_argument('--resume_weight_only', action='store_true')
 
-  parser.add_argument('--do_train', action='store_true')
+  parser.add_argument('--do_train', action='store_true', default=True)
   parser.add_argument('--do_test', action='store_true', default=True)
   parser.add_argument('--do_valid_only', action='store_true')
   parser.add_argument('--rl_compute_frequency', type=int, default=1)
@@ -179,11 +179,12 @@ def main(args):
   trainer = Trainer(
       accelerator="auto",
       devices=torch.cuda.device_count() if torch.cuda.is_available() else None,  
+      # devices=1,  
       max_epochs=epochs,
       callbacks=[TQDMProgressBar(refresh_rate=20), checkpoint_callback, lr_callback, gradient_callback],
       logger=tb_logger,
       check_val_every_n_epoch=1,
-      strategy=DDPStrategy(static_graph=True),
+      strategy=DDPStrategy(static_graph=True), 
       precision=16 if args.fp16 else 32,
   )
 

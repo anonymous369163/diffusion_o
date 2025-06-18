@@ -1,18 +1,124 @@
 """Lightning module for training the DIFUSCO TSP model."""
 
-import os
+import warnings
+warnings.simplefilter("ignore", UserWarning)
+warnings.simplefilter("ignore", FutureWarning)
 
+import os
+import time
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.utils.data
 from pytorch_lightning.utilities import rank_zero_info
+import matplotlib.pyplot as plt
 
 from co_datasets.tsp_graph_dataset import TSPGraphDataset
 from pl_meta_model import COMetaModel
 from utils.diffusion_schedulers import InferenceSchedule
-from utils.tsp_utils import TSPEvaluator, batched_two_opt_torch  # , merge_tours  # 注释掉因为改用强化学习方法
+from utils.tsp_utils import TSPEvaluator, batched_two_opt_torch, merge_tours 
+
+
+def visualize_tsp_routes(points, gt_path, pred_path, gt_cost, pred_cost, 
+                        save_dir=None, filename_prefix="route_comparison",
+                        split="test", batch_idx=0, show_plot=False):
+    """
+    可视化TSP路径对比函数
+    
+    Args:
+        points: numpy数组, shape (num_nodes, 2), 节点坐标
+        gt_path: numpy数组, shape (num_nodes,), 真实路径 
+        pred_path: numpy数组, shape (num_nodes,), 预测路径
+        gt_cost: float, 真实路径成本
+        pred_cost: float, 预测路径成本
+        save_dir: str, 图片保存目录，如果为None则不保存
+        filename_prefix: str, 文件名前缀
+        split: str, 数据集分割标识
+        batch_idx: int, 批次索引
+        show_plot: bool, 是否显示图片
+        
+    Returns:
+        fig: matplotlib图形对象
+    """
+    # 创建图形
+    # 设置matplotlib支持中文显示
+    plt.rcParams['font.sans-serif'] = ['SimHei']  # 用来正常显示中文标签
+    plt.rcParams['axes.unicode_minus'] = False  # 用来正常显示负号
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
+    
+    # 绘制真实路径
+    ax1.scatter(points[:, 0], points[:, 1], c='blue', s=50, alpha=0.7)
+    for i in range(len(gt_path)):
+        start = points[gt_path[i]]
+        end = points[gt_path[(i + 1) % len(gt_path)]]
+        ax1.plot([start[0], end[0]], [start[1], end[1]], 'r-', linewidth=2, alpha=0.8)
+    ax1.set_title(f'真实路径 (成本: {gt_cost:.2f})', fontsize=12, fontweight='bold')
+    ax1.grid(True, alpha=0.3)
+    ax1.set_aspect('equal')
+    
+    # 绘制预测路径
+    ax2.scatter(points[:, 0], points[:, 1], c='blue', s=50, alpha=0.7)
+    for i in range(len(pred_path)):
+        start = points[pred_path[i]]
+        end = points[pred_path[(i + 1) % len(pred_path)]]
+        ax2.plot([start[0], end[0]], [start[1], end[1]], 'g-', linewidth=2, alpha=0.8)
+    
+    # 计算误差百分比
+    gap_percentage = ((pred_cost - gt_cost) / gt_cost) * 100
+    ax2.set_title(f'预测路径 (成本: {pred_cost:.2f}, 误差: {gap_percentage:.1f}%)', 
+                  fontsize=12, fontweight='bold')
+    ax2.grid(True, alpha=0.3)
+    ax2.set_aspect('equal')
+    
+    plt.tight_layout()
+    
+    # 保存图片
+    if save_dir is not None:
+        os.makedirs(save_dir, exist_ok=True)
+        filename = f'{filename_prefix}_{split}_{batch_idx}.png'
+        save_path = os.path.join(save_dir, filename)
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+        print(f"路径可视化已保存到: {save_path}")
+    
+    # 显示图片
+    if show_plot:
+        plt.show()
+    else:
+        plt.close()
+    
+    return fig
+
+
+def debug_visualize_tsp(points, gt_path, pred_path, gt_cost, pred_cost, 
+                       save_path="./debug_tsp_vis.png", show=True):
+    """
+    快速调试可视化TSP路径的简化函数
+    
+    Args:
+        points: 节点坐标数组
+        gt_path: 真实路径
+        pred_path: 预测路径  
+        gt_cost: 真实成本
+        pred_cost: 预测成本
+        save_path: 保存路径（可选）
+        show: 是否显示图片
+    """
+    save_dir = os.path.dirname(save_path) if save_path else None
+    filename = os.path.basename(save_path).replace('.png', '') if save_path else None
+    
+    return visualize_tsp_routes(
+        points=points,
+        gt_path=gt_path, 
+        pred_path=pred_path,
+        gt_cost=gt_cost,
+        pred_cost=pred_cost,
+        save_dir=save_dir,
+        filename_prefix=filename or "debug_tsp",
+        split="debug",
+        batch_idx=0,
+        show_plot=show
+    )
 
 
 def greedy_tsp_solver_batch_pomo(adj_matrix_batch, temperature=1.0):
@@ -668,40 +774,25 @@ class TSPModel(COMetaModel):
     best_solved_cost = np.min(all_solved_costs)
 
     # 可视化对比真实路径和预测路径
-    debug_mode = True
+    debug_mode = False
     if debug_mode: 
-        import matplotlib.pyplot as plt
-        
-        # 只可视化第一个样本以避免生成过多图片
-        points = np_points  # shape: (num_nodes, 2) 
-        gt_path = np_gt_tour # shape: (num_nodes,)
-        pred_path = solved_tours[0]  # shape: (num_nodes,)
-        
-        # 创建图形
-        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
-        
-        # 绘制真实路径
-        ax1.scatter(points[:, 0], points[:, 1], c='blue', s=50)
-        for i in range(len(gt_path)):
-            start = points[gt_path[i]]
-            end = points[gt_path[(i + 1) % len(gt_path)]]
-            ax1.plot([start[0], end[0]], [start[1], end[1]], 'r-')
-        ax1.set_title(f'真实路径 (成本: {gt_cost:.2f})')
-        
-        # 绘制预测路径
-        ax2.scatter(points[:, 0], points[:, 1], c='blue', s=50)
-        for i in range(len(pred_path)):
-            start = points[pred_path[i]]
-            end = points[pred_path[(i + 1) % len(pred_path)]]
-            ax2.plot([start[0], end[0]], [start[1], end[1]], 'g-')
-        ax2.set_title(f'预测路径 (成本: {best_solved_cost:.2f})')
-        
-        # 保存图片
+        # 获取保存目录
         exp_save_dir = os.path.join(self.logger.save_dir, self.logger.name, str(self.logger.version))
         vis_path = os.path.join(exp_save_dir, 'route_visualization')
-        os.makedirs(vis_path, exist_ok=True)
-        plt.savefig(os.path.join(vis_path, f'route_comparison_{split}_{batch_idx}.png'))
-        plt.close() 
+        
+        # 调用封装的可视化函数
+        visualize_tsp_routes(
+            points=np_points,
+            gt_path=np_gt_tour,
+            pred_path=solved_tours[0],
+            gt_cost=gt_cost,
+            pred_cost=best_solved_cost,
+            save_dir=vis_path,
+            filename_prefix="route_comparison",
+            split=split,
+            batch_idx=batch_idx,
+            show_plot=False
+        )
     
 
     # 计算额外的性能指标

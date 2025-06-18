@@ -22,11 +22,11 @@ python -u difusco/train.py \
   --validation_examples 8 \
   --inference_schedule "cosine" \
   --inference_diffusion_steps 50 \
-  --rl_compute_frequency 10 \
+  --rl_compute_frequency 1 \
   --use_pomo \
-  --rl_loss_weight 0.1 \
+  --rl_loss_weight 0.01 \
   --rl_baseline_decay 0.95 \
-  --pomo_temperature 0.5 \
+  --pomo_temperature 1 \
   --do_train \
   --do_test 
   
