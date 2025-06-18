@@ -121,7 +121,7 @@ class TSPModel(COMetaModel):
 
   def categorical_denoise_step(self, points, xt, t, device, edge_index=None, target_t=None):
     with torch.no_grad():
-      t = torch.from_numpy(t).view(1)
+      t = torch.from_numpy(t).view(1).to(device)
       x0_pred = self.forward(
           points.float().to(device),
           xt.float().to(device),
@@ -139,7 +139,7 @@ class TSPModel(COMetaModel):
 
   def gaussian_denoise_step(self, points, xt, t, device, edge_index=None, target_t=None):
     with torch.no_grad():
-      t = torch.from_numpy(t).view(1)
+      t = torch.from_numpy(t).view(1).to(device)
       pred = self.forward(
           points.float().to(device),
           xt.float().to(device),

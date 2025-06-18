@@ -1,9 +1,7 @@
+#!/bin/bash
+
 export PYTHONPATH="$PWD:$PYTHONPATH"
 export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
-
-# shellcheck disable=SC2155
-# export WANDB_RUN_ID=$(python -c "import wandb; print(wandb.util.generate_id())")
-# echo "WANDB_ID is $WANDB_RUN_ID"
 
 python -u difusco/train.py \
   --task "tsp" \
