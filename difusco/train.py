@@ -19,7 +19,7 @@ from pl_mis_model import MISModel
 class GradientLoggingCallback(pl.Callback):
     """记录梯度范数等重要训练信息的回调函数"""
     
-    def on_before_optimizer_step(self, trainer, pl_module, optimizer, optimizer_idx):
+    def on_before_optimizer_step(self, trainer, pl_module, optimizer):
         # 计算梯度范数
         total_norm = 0
         param_count = 0
@@ -84,7 +84,7 @@ def arg_parser():
   parser.add_argument('--ckpt_path', type=str, default=None)
   parser.add_argument('--resume_weight_only', action='store_true')
 
-  parser.add_argument('--do_train', action='store_true')
+  parser.add_argument('--do_train', action='store_true', default=False)
   parser.add_argument('--do_test', action='store_true', default=True)
   parser.add_argument('--do_valid_only', action='store_true')
   parser.add_argument('--rl_compute_frequency', type=int, default=1)
@@ -92,6 +92,8 @@ def arg_parser():
   parser.add_argument('--rl_loss_weight', type=float, default=0.01)
   parser.add_argument('--rl_baseline_decay', type=float, default=0.95)
   parser.add_argument('--pomo_temperature', type=float, default=1.0)
+  parser.add_argument('--no_debug', action='store_true', default=False)
+  parser.add_argument('--problem_type', type=str, default='TSP')
 
   args = parser.parse_args()
   return args
@@ -112,16 +114,30 @@ def main(args):
     model_class = MISModel
     saving_mode = 'max'
   else:
-    raise NotImplementedError
+    model_class = TSPModel
+    saving_mode = 'min'
 
   model = model_class(param_args=args)
 
-  # Create TensorBoard logger
+  # 根据训练或测试阶段确定版本名称
+  tb_save_dir = os.path.join(args.storage_path, 'tb_logs')
+  logger_name = args.logger_name or project_name
+  
+  # 修改：不再手动计算版本号，让TensorBoardLogger自动管理
+  if args.do_train:
+    # 训练阶段 - 添加train前缀到logger名称
+    logger_name_with_phase = f"{logger_name}_train"
+  else:
+    # 仅测试阶段 - 添加test前缀到logger名称  
+    logger_name_with_phase = f"{logger_name}_test"
+
+  # Create TensorBoard logger - 不指定version，让它自动递增
   tb_logger = TensorBoardLogger(
-      save_dir=os.path.join(args.storage_path, 'tb_logs'),
-      name=args.logger_name or project_name,
+      save_dir=tb_save_dir,
+      name=logger_name_with_phase,
+      # 移除手动指定的version参数，让TensorBoardLogger自动管理
   )
-  rank_zero_info(f"Logging to {tb_logger.save_dir}/{tb_logger.name}/{tb_logger.version}")
+  rank_zero_info(f"Logging to {tb_logger.log_dir}")  # 直接显示完整的日志目录路径
 
   # 记录重要的训练信息
   if rank_zero_info:
@@ -166,26 +182,34 @@ def main(args):
     tb_logger.experiment.add_text("diffusion_config", diffusion_config, 0)
 
   checkpoint_callback = ModelCheckpoint(
-      monitor='val/solved_cost', mode=saving_mode,
+      monitor='val/best_solved_cost', mode=saving_mode,
       save_top_k=3, save_last=True,
-      dirpath=os.path.join(tb_logger.save_dir,
-                           tb_logger.name,
-                           f'version_{tb_logger.version}',
-                           'checkpoints'),
+      dirpath=os.path.join(tb_logger.log_dir, 'checkpoints'),  # 使用log_dir确保路径一致
   )
   lr_callback = LearningRateMonitor(logging_interval='step')
   gradient_callback = GradientLoggingCallback()
 
-  trainer = Trainer(
+  if args.no_debug:  # no_debug表示训练模型，不是debug模式
+    trainer = Trainer(
       accelerator="auto",
       devices=torch.cuda.device_count() if torch.cuda.is_available() else None,  
       max_epochs=epochs,
       callbacks=[TQDMProgressBar(refresh_rate=20), checkpoint_callback, lr_callback, gradient_callback],
       logger=tb_logger,
       check_val_every_n_epoch=1,
-      strategy=DDPStrategy(static_graph=True),
+      strategy= DDPStrategy(static_graph=True),
       precision=16 if args.fp16 else 32,
   )
+  else:
+    trainer = Trainer(
+        accelerator="auto",
+        devices=1 if not args.no_debug else torch.cuda.device_count() if torch.cuda.is_available() else None,  
+        max_epochs=epochs,
+        callbacks=[TQDMProgressBar(refresh_rate=20), checkpoint_callback, lr_callback, gradient_callback],
+        logger=tb_logger,
+        check_val_every_n_epoch=1, 
+        precision=16 if args.fp16 else 32,
+    )
 
   rank_zero_info(
       f"{'-' * 100}\n"

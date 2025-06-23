@@ -17,13 +17,16 @@ class COMetaModel(pl.LightningModule):
   def __init__(self,
                param_args,
                node_feature_only=False):
-    super(COMetaModel, self).__init__()
+    super().__init__()
     self.args = param_args
     self.diffusion_type = self.args.diffusion_type
     self.diffusion_schedule = self.args.diffusion_schedule
     self.diffusion_steps = self.args.diffusion_steps
     self.sparse = self.args.sparse_factor > 0 or node_feature_only
-
+    
+    # 初始化用于存储测试输出的实例属性
+    self.test_outputs = []
+    
     # 保存重要的超参数到tensorboard
     hyperparams_to_save = {
         # 模型架构参数
@@ -92,9 +95,13 @@ class COMetaModel(pl.LightningModule):
     )
     self.num_training_steps_cached = None
 
-  def test_epoch_end(self, outputs):
+  def on_test_epoch_end(self):
+    """新的测试epoch结束钩子函数，替代已废弃的test_epoch_end"""
+    if not self.test_outputs:
+      return
+      
     unmerged_metrics = {}
-    for metrics in outputs:
+    for metrics in self.test_outputs:
       for k, v in metrics.items():
         if k not in unmerged_metrics:
           unmerged_metrics[k] = []
@@ -103,7 +110,30 @@ class COMetaModel(pl.LightningModule):
     merged_metrics = {}
     for k, v in unmerged_metrics.items():
       merged_metrics[k] = float(np.mean(v))
-    self.logger.log_metrics(merged_metrics, step=self.global_step)
+    
+    # 使用新的日志记录方式
+    self.log_dict(merged_metrics, on_step=False, on_epoch=True)
+    
+    # 清空输出列表以便下次使用
+    self.test_outputs.clear()
+
+  def test_step(self, batch, batch_idx):
+    """测试步骤需要将输出保存到实例属性中"""
+    # 执行实际的测试逻辑（这部分需要在子类中实现）
+    # 这里只是示例框架
+    result = self._test_step_impl(batch, batch_idx)
+    
+    # 将结果保存到实例属性中
+    if result is not None:
+      self.test_outputs.append(result)
+    
+    return result
+
+  def _test_step_impl(self, batch, batch_idx):
+    """实际的测试步骤实现，需要在子类中重写"""
+    # 这个方法应该在子类中实现具体的测试逻辑
+    # 这里只是一个占位符
+    pass
 
   def get_total_num_training_steps(self) -> int:
     """Total training steps inferred from datamodule and devices."""

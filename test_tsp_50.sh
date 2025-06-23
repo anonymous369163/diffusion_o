@@ -1,7 +1,10 @@
 #!/bin/bash
 # 激活conda环境
 # 添加执行权限
-source /yuepeng/code/conda-envs/bin/activate
+eval "$(conda shell.bash hook)"
+
+conda activate difusco_basic_py39
+
 
 export PYTHONPATH="$PWD:$PYTHONPATH"
 export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
@@ -24,11 +27,13 @@ python -u difusco/train.py \
   --inference_diffusion_steps 50 \
   --rl_compute_frequency 10 \
   --use_pomo \
-  --rl_loss_weight 0.1 \
+  --rl_loss_weight 0.01 \
   --rl_baseline_decay 0.95 \
-  --pomo_temperature 0.5 \
+  --pomo_temperature 1 \
   --do_test \
-  --ckpt_path "./tb_logs/tsp_diffusion/version_9/checkpoints/last.ckpt"
+  --no_debug \
+  --ckpt_path "./tb_logs/tsp_50_rl_0.0_train/version_2/checkpoints/last.ckpt"
+  # --ckpt_path "./tb_logs/tsp_diffusion_train/version_0/checkpoints/last.ckpt"
 # tensorboard --logdir=./tb_logs &
 # echo "Training completed!"
 # echo "启动 Tensorboard 服务..."

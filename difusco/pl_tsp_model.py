@@ -8,11 +8,12 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.utils.data
 from pytorch_lightning.utilities import rank_zero_info
+import matplotlib.pyplot as plt
 
-from co_datasets.tsp_graph_dataset import TSPGraphDataset
+from co_datasets.tsp_graph_dataset import TSPGraphDataset, VRPGraphDataset
 from pl_meta_model import COMetaModel
 from utils.diffusion_schedulers import InferenceSchedule
-from utils.tsp_utils import TSPEvaluator, batched_two_opt_torch  # , merge_tours  # 注释掉因为改用强化学习方法
+from utils.tsp_utils import TSPEvaluator, batched_two_opt_torch, merge_tours  # 注释掉因为改用强化学习方法
 
 
 def greedy_tsp_solver_batch_pomo(adj_matrix_batch, temperature=1.0):
@@ -254,22 +255,46 @@ class TSPModel(COMetaModel):
                param_args=None):
     super(TSPModel, self).__init__(param_args=param_args, node_feature_only=False)
 
-    self.train_dataset = TSPGraphDataset(
-        data_file=os.path.join(self.args.storage_path, self.args.training_split),
-        sparse_factor=self.args.sparse_factor,
-    )
+    # ["TSP", "CVRP", "OVRP", "VRPB","VRPL", "VRPTW", "OVRPTW", "OVRPB", "VRPBL", "VRPBTW", "VRPLTW", "OVRPBL", "OVRPBTW", "OVRPLTW", "VRPBLTW", "OVRPBLTW"]
+    self.problem_type = self.args.problem_type   # 获取问题类型
 
-    # 创建测试集并只保留前1000条数据
-    self.test_dataset = TSPGraphDataset(
-        data_file=os.path.join(self.args.storage_path, self.args.test_split),
-        sparse_factor=self.args.sparse_factor,
-    )
-    self.test_dataset.file_lines = self.test_dataset.file_lines[:1000]
+    if self.problem_type != "TSP":
+      self.train_dataset = VRPGraphDataset(
+      data_file=os.path.join(self.args.storage_path, 'data/vrp/'+self.problem_type+'.pkl'),
+      sparse_factor=self.args.sparse_factor,
+      data_size = 5000 - 128
+      )
 
-    self.validation_dataset = TSPGraphDataset(
-        data_file=os.path.join(self.args.storage_path, self.args.validation_split),
-        sparse_factor=self.args.sparse_factor,
-    )
+      self.test_dataset = VRPGraphDataset(
+          data_file=os.path.join(self.args.storage_path, 'data/vrp/'+self.problem_type+'.pkl'),
+          sparse_factor=self.args.sparse_factor,
+          data_size = 64,
+          start_idx = 5000 - 128
+      )
+
+      self.validation_dataset = VRPGraphDataset(
+          data_file=os.path.join(self.args.storage_path, 'data/vrp/'+self.problem_type+'.pkl'),
+          sparse_factor=self.args.sparse_factor,
+          data_size = 64,
+          start_idx = 5000 - 64
+      )
+
+    else:   # origin: TSP
+      self.train_dataset = TSPGraphDataset(
+          data_file=os.path.join(self.args.storage_path, self.args.training_split),
+          sparse_factor=self.args.sparse_factor,
+      )
+ 
+      self.test_dataset = TSPGraphDataset(
+          data_file=os.path.join(self.args.storage_path, self.args.test_split),
+          sparse_factor=self.args.sparse_factor,
+      )
+      # self.test_dataset.file_lines = self.test_dataset.file_lines[:1000]  # debug 使用
+
+      self.validation_dataset = TSPGraphDataset(
+          data_file=os.path.join(self.args.storage_path, self.args.validation_split),
+          sparse_factor=self.args.sparse_factor,
+      )
     
     # 强化学习相关参数
     self.rl_loss_weight = getattr(self.args, 'rl_loss_weight', 0.1)  # 强化学习损失权重
@@ -451,7 +476,7 @@ class TSPModel(COMetaModel):
     
     # 记录扩散时间步信息
     avg_t = np.mean(np.random.randint(1, self.diffusion.T + 1, points.shape[0]).astype(int))
-    self.log("train/avg_diffusion_timestep", avg_t, on_step=True, on_epoch=True)
+    self.log("train/avg_diffusion_timestep", avg_t, on_step=True, on_epoch=True, sync_dist=True)
     
     return total_loss
 
@@ -668,8 +693,8 @@ class TSPModel(COMetaModel):
     best_solved_cost = np.min(all_solved_costs)
 
     # 可视化对比真实路径和预测路径
-    debug_mode = True
-    if debug_mode: 
+    debug_mode = False   # 临时启用以测试路径修复
+    if debug_mode:
         import matplotlib.pyplot as plt
         
         # 只可视化第一个样本以避免生成过多图片
@@ -697,10 +722,29 @@ class TSPModel(COMetaModel):
         ax2.set_title(f'预测路径 (成本: {best_solved_cost:.2f})')
         
         # 保存图片
-        exp_save_dir = os.path.join(self.logger.save_dir, self.logger.name, str(self.logger.version))
+        # 优先使用checkpoint路径的父目录（如果有的话），否则使用当前logger的目录
+        if hasattr(self.trainer, 'ckpt_path') and self.trainer.ckpt_path is not None:
+            # 从checkpoint路径推断出实验目录
+            # checkpoint路径格式: ./tb_logs/tsp_diffusion_train/version_0/checkpoints/last.ckpt
+            # 我们需要获取: ./tb_logs/tsp_diffusion_train/version_0/
+            ckpt_path = self.trainer.ckpt_path
+            # 获取checkpoint目录的父目录（即版本目录）
+            exp_save_dir = os.path.dirname(os.path.dirname(ckpt_path))
+        else:
+            # 如果没有checkpoint路径，使用当前logger的目录
+            exp_save_dir = self.logger.log_dir
+            
         vis_path = os.path.join(exp_save_dir, 'route_visualization')
         os.makedirs(vis_path, exist_ok=True)
-        plt.savefig(os.path.join(vis_path, f'route_comparison_{split}_{batch_idx}.png'))
+        
+        # 构建包含模型版本信息的文件名
+        model_info = f"v{self.logger.version}_{self.logger.name}"
+        use_pomo = getattr(self.args, 'use_pomo', True)
+        pomo_info = "pomo" if use_pomo else "greedy"
+        test_temp = getattr(self.args, 'test_temperature', 0.0)
+        
+        filename = f'route_comparison_{model_info}_{pomo_info}_temp{test_temp}_{split}_batch{batch_idx}.png'
+        plt.savefig(os.path.join(vis_path, filename))
         plt.close() 
     
 
@@ -720,20 +764,38 @@ class TSPModel(COMetaModel):
         f"{split}/total_sampling": total_sampling,
         f"{split}/sequential_sampling": self.args.sequential_sampling,
         f"{split}/parallel_sampling": self.args.parallel_sampling,
+        f"{split}/best_solved_cost": best_solved_cost,
+        f"{split}/diffusion_steps": self.args.inference_diffusion_steps,
     }
     
+    # 记录所有指标到TensorBoard和PyTorch Lightning
     for k, v in metrics.items():
-      self.log(k, v, on_epoch=True, sync_dist=True)
+        # 跳过best_solved_cost，因为我们会单独记录它以添加进度条显示
+        if not k.endswith('/best_solved_cost'):
+            self.log(k, v, on_epoch=True, sync_dist=True)
     
-    # 特别标记最重要的指标用于进度条显示，统一参数以避免重复记录错误
-    self.log(f"{split}/solved_cost", best_solved_cost, prog_bar=True, on_epoch=True, sync_dist=True)
+    # 特别标记最重要的指标用于进度条显示
+    self.log(f"{split}/best_solved_cost", best_solved_cost, prog_bar=True, on_epoch=True, sync_dist=True)
+    
+    # 将结果保存到父类的test_outputs列表中（兼容PyTorch Lightning 2.0+）
+    self.test_outputs.append(metrics)
     
     return metrics
 
   def run_save_numpy_heatmap(self, adj_mat, np_points, real_batch_idx, split):
     if self.args.parallel_sampling > 1 or self.args.sequential_sampling > 1:
       raise NotImplementedError("Save numpy heatmap only support single sampling")
-    exp_save_dir = os.path.join(self.logger.save_dir, self.logger.name, self.logger.version)
+    
+    # 优先使用checkpoint路径的父目录（如果有的话），否则使用当前logger的目录
+    if hasattr(self.trainer, 'ckpt_path') and self.trainer.ckpt_path is not None:
+        # 从checkpoint路径推断出实验目录
+        ckpt_path = self.trainer.ckpt_path
+        # 获取checkpoint目录的父目录（即版本目录）
+        exp_save_dir = os.path.dirname(os.path.dirname(ckpt_path))
+    else:
+        # 如果没有checkpoint路径，使用当前logger的目录
+        exp_save_dir = self.logger.log_dir
+        
     heatmap_path = os.path.join(exp_save_dir, 'numpy_heatmap')
     rank_zero_info(f"Saving heatmap to {heatmap_path}")
     os.makedirs(heatmap_path, exist_ok=True)
