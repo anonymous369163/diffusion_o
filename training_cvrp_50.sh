@@ -3,7 +3,7 @@
 # 初始化conda
 eval "$(conda shell.bash hook)"
 
-conda activate difusco_basic_py39
+conda activate difusco_39
 
 export PYTHONPATH="$PWD:$PYTHONPATH"
 export CUDA_VISIBLE_DEVICES=1,2,3,4,5,6,7
