@@ -9,23 +9,13 @@ scripts
 *.pyc
 /mtnco
 /saved_models
-/runs
-difusco/__pycache__/pl_meta_model.cpython-37.pyc
-data/vrp/CVRP.pkl
-data/vrp/OVRP.pkl
-data/vrp/OVRPB.pkl
-data/vrp/OVRPBL.pkl
-data/vrp/OVRPBLTW.pkl
-data/vrp/OVRPBTW.pkl
-data/vrp/OVRPLTW.pkl
-data/vrp/OVRPTW.pkl
-data/vrp/VRPB.pkl
-data/vrp/VRPBL.pkl
-data/vrp/VRPBLTW.pkl
-data/vrp/VRPBTW.pkl
-data/vrp/VRPL.pkl
-data/vrp/VRPLTW.pkl
-data/vrp/VRPTW.pkl
-difusco/__pycache__/pl_meta_model.cpython-37.pyc
-difusco/__pycache__/pl_mis_model.cpython-37.pyc
-difusco/__pycache__/pl_tsp_model.cpython-37.pyc
+/runs 
+
+# 忽略所有 .pkl、.txt、.pyc 文件
+*.pkl
+*.txt
+*.pyc
+
+# 忽略整个 MTNCO 和 tb_logs 文件夹（包含子文件与子文件夹）
+MTNCO/
+tb_logs/

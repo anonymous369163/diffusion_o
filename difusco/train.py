@@ -5,8 +5,7 @@ from argparse import ArgumentParser
 
 import torch
 from pytorch_lightning import Trainer
-from pytorch_lightning.callbacks import LearningRateMonitor, ModelCheckpoint
-from pytorch_lightning.callbacks.progress import TQDMProgressBar
+from pytorch_lightning.callbacks import LearningRateMonitor, ModelCheckpoint, TQDMProgressBar
 from pytorch_lightning.loggers import TensorBoardLogger
 from pytorch_lightning.strategies.ddp import DDPStrategy
 from pytorch_lightning.utilities import rank_zero_info
@@ -94,6 +93,7 @@ def arg_parser():
   parser.add_argument('--pomo_temperature', type=float, default=1.0)
   parser.add_argument('--no_debug', action='store_true', default=False)
   parser.add_argument('--problem_type', type=str, default='TSP')
+  parser.add_argument('--add_prior', action='store_true', default=False)
 
   args = parser.parse_args()
   return args
@@ -192,7 +192,7 @@ def main(args):
   if args.no_debug:  # no_debug表示训练模型，不是debug模式
     trainer = Trainer(
       accelerator="auto",
-      devices=torch.cuda.device_count() if torch.cuda.is_available() else None,  
+      devices=torch.cuda.device_count() if torch.cuda.is_available() else 0,  
       max_epochs=epochs,
       callbacks=[TQDMProgressBar(refresh_rate=20), checkpoint_callback, lr_callback, gradient_callback],
       logger=tb_logger,
@@ -203,7 +203,7 @@ def main(args):
   else:
     trainer = Trainer(
         accelerator="auto",
-        devices=1 if not args.no_debug else torch.cuda.device_count() if torch.cuda.is_available() else None,  
+        devices=1 if not args.no_debug else torch.cuda.device_count() if torch.cuda.is_available() else 0,  
         max_epochs=epochs,
         callbacks=[TQDMProgressBar(refresh_rate=20), checkpoint_callback, lr_callback, gradient_callback],
         logger=tb_logger,

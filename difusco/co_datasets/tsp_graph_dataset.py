@@ -83,32 +83,49 @@ class TSPGraphDataset(torch.utils.data.Dataset):
 import pickle
 
 class VRPGraphDataset(torch.utils.data.Dataset):
-  def __init__(self, data_file='../../data/tsp/vrp_dataset.pkl', sparse_factor=-1, data_size=None, start_idx=0):
+  def __init__(self, data_file, sparse_factor=-1):
     self.data_file = data_file
     self.sparse_factor = sparse_factor
     with open(data_file, 'rb') as f:
       self.file_lines = pickle.load(f)
+    
+    # pre-process the data
+    # 列车的容量初始容量都是1，解码过程中列车的实际容量，当前时间，所行驶的长度和路径是否需要返回到起点，这些都是动态属性，需要解码过程中动态计算，便于处理约束
+    self.file_lines["depot_xy"] = np.concatenate(self.file_lines["depot_xy"], axis=0)
+    self.file_lines["node_xy"] = np.concatenate(self.file_lines["node_xy"], axis=0)
+    self.file_lines["node_demand"] = np.concatenate(self.file_lines["node_demand"], axis=0)
+    self.file_lines["node_earlyTW"] = np.concatenate(self.file_lines["node_earlyTW"], axis=0)
+    self.file_lines["node_lateTW"] = np.concatenate(self.file_lines["node_lateTW"], axis=0)
+    self.file_lines["route_open"] = np.concatenate(self.file_lines["route_open"], axis=0)
+    self.file_lines["length"] = np.concatenate(self.file_lines["length"], axis=0)
+    self.file_lines["tours"] = np.concatenate(self.file_lines["tours"], axis=0)
 
-    if data_size is not None:
-      self.data_size = data_size
-      self.file_lines['node_xy'] = self.file_lines['node_xy'][start_idx:start_idx+data_size]
-      self.file_lines['route'] = self.file_lines['route'][start_idx:start_idx+data_size]
-
+    print(f'Loaded "{data_file}" with {len(self.file_lines["depot_xy"])} lines')
 
   def __len__(self):
-    return len(self.file_lines["node_xy"])
+    return len(self.file_lines["depot_xy"])
 
   def get_example(self, idx):
     # Select sample from self.file_lines
-    tour = self.file_lines["route"][idx]
-    points = self.file_lines["node_xy"][idx]
-    points = points[:, :2]
-    # if  idx < 1280:
-    #   zeros = np.zeros((points.shape[0], 3))   # d, e, l 新引入的三个属性，分别表示节点需求，time window的early time 和 late time 
-    #   points = np.concatenate([points, zeros], axis=1)
-    # else:
-    #   ones = np.ones((points.shape[0], 2))   # d, l 新引入的两个属性，分别表示节点需求和time window的late time 
-    #   points = np.concatenate([points, ones], axis=1)
+    depot_xy = self.file_lines["depot_xy"][idx]
+    node_xy = self.file_lines["node_xy"][idx]
+    node_demand = self.file_lines["node_demand"][idx]
+    node_earlyTW = self.file_lines["node_earlyTW"][idx]
+    node_lateTW = self.file_lines["node_lateTW"][idx]
+    route_open = self.file_lines["route_open"][idx]
+    length = self.file_lines["length"][idx]
+    solutions = self.file_lines["tours"][idx]
+
+    # 每个维度都加上一些额外的属性
+    depot_xy = np.concatenate([depot_xy, np.zeros((1, 5))], axis=1)
+    points = np.concatenate([node_xy,
+                             node_demand.reshape(-1, 1),
+                             node_earlyTW.reshape(-1, 1),
+                             node_lateTW.reshape(-1, 1),
+                             route_open.reshape(-1, 1),
+                             length.reshape(-1, 1)], axis=1)
+    points = np.concatenate([depot_xy, points], axis=0)
+    tour = solutions
     return points, tour
 
   def __getitem__(self, idx):
@@ -125,6 +142,7 @@ class VRPGraphDataset(torch.utils.data.Dataset):
           torch.from_numpy(adj_matrix).float(),
           torch.from_numpy(tour).long(),
       )
-    else:
-      # 对于稀疏图,抛出NotImplementedError异常
-      raise NotImplementedError("稀疏图的处理尚未实现")
+    else:   
+      # Return a sparse graph where each node is connected to its k nearest neighbors
+      # k = self.sparse_factor
+      raise NotImplementedError("Sparse graph is not supported for VRP")

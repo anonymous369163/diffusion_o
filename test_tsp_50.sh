@@ -3,7 +3,7 @@
 # 添加执行权限
 eval "$(conda shell.bash hook)"
 
-conda activate difusco_basic_py39
+conda activate difusco_39
 
 
 export PYTHONPATH="$PWD:$PYTHONPATH"
@@ -32,7 +32,8 @@ python -u difusco/train.py \
   --pomo_temperature 1 \
   --do_test \
   --no_debug \
-  --ckpt_path "./tb_logs/tsp_50_rl_0.0_train/version_2/checkpoints/last.ckpt"
+  --ckpt_path "./tb_logs/tsp_50_rl_debug_train/version_0/checkpoints/last.ckpt"
+  # --ckpt_path "./tb_logs/tsp_50_rl_0.0_train/version_2/checkpoints/last.ckpt"
   # --ckpt_path "./tb_logs/tsp_diffusion_train/version_0/checkpoints/last.ckpt"
 # tensorboard --logdir=./tb_logs &
 # echo "Training completed!"
