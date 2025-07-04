@@ -6,11 +6,11 @@ eval "$(conda shell.bash hook)"
 conda activate difusco_39
 
 export PYTHONPATH="$PWD:$PYTHONPATH"
-export CUDA_VISIBLE_DEVICES=4,5,6,7
+export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
 cd "$(dirname "$0")"
 
 python -u difusco/train.py \
-  --task "cvrp" \
+  --task "tsp" \
   --diffusion_type "categorical" \
   --learning_rate 0.0002 \
   --weight_decay 0.0001 \
@@ -29,11 +29,11 @@ python -u difusco/train.py \
   --do_train \
   --do_test \
   --no_debug \
-  --logger_name "cvrp_50_rl" \
-  --problem_type "CVRP" \
-  --training_split "data/vrp/CVRP50.pkl" \
-  --validation_split "data/vrp/CVRP50.pkl" \
-  --test_split "data/vrp/CVRP50.pkl" \
+  --logger_name "tsp_50_rl_f10" \
+  --problem_type "TSP" \
+  --training_split "data/tsp/tsp50_train_concorde.txt" \
+  --validation_split "data/tsp/tsp50_test_concorde.txt" \
+  --test_split "data/tsp/tsp50_test_concorde.txt" \
 
 # ["TSP", "CVRP", "OVRP", "VRPB","VRPL", "VRPTW", "OVRPTW", "OVRPB", "VRPBL", "VRPBTW", "VRPLTW", "OVRPBL", "OVRPBTW", "OVRPLTW", "VRPBLTW", "OVRPBLTW"]
 # tensorboard --logdir=./tb_logs &

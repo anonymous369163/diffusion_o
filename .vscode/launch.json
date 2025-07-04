@@ -40,7 +40,7 @@
                 "--rl_loss_weight", "0.0",
                 "--rl_baseline_decay", "0.95",
                 "--pomo_temperature", "1",
-                // "--do_train",
+                "--do_train",
                 "--do_test",
                 "--logger_name", "cvrp_50_rl_0.0",
                 "--problem_type", "OVRPBLTW",

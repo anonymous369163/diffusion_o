@@ -15,7 +15,6 @@ scripts
 *.pkl
 *.txt
 *.pyc
-
-# 忽略整个 MTNCO 和 tb_logs 文件夹（包含子文件与子文件夹）
+/MTNCO
 MTNCO/
 tb_logs/
