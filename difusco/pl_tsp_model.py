@@ -16,6 +16,7 @@ import matplotlib.patches as patches
 from matplotlib.colors import LinearSegmentedColormap
 
 from co_datasets.tsp_graph_dataset import TSPGraphDataset, VRPGraphDataset
+from co_datasets.hybrid_graph_dataset import HybridGraphDataset
 from pl_meta_model import COMetaModel
 from utils.diffusion_schedulers import InferenceSchedule
 from utils.tsp_utils import TSPEvaluator, batched_two_opt_torch, merge_tours  # 注释掉因为改用强化学习方法
@@ -489,7 +490,8 @@ def visualize_vrp_solution(points, tour, points_with_features=None, problem_type
     return fig, execution_history
 
 
-def greedy_tsp_solver_batch_pomo(adj_matrix_batch, points_with_features, temperature=1.0, problem_type="TSP", add_prior=False):
+def greedy_solver_batch_pomo(adj_matrix_batch, points_with_features, temperature=1.0, problem_type="TSP", add_prior=False, 
+                             test_mode=False, distance_matrices=None, current_epoch=None, max_epochs=None):
     """
     POMO版本的批量TSP/VRP求解器 - 同时从多个起始点求解以获得更好的解
     
@@ -520,6 +522,14 @@ def greedy_tsp_solver_batch_pomo(adj_matrix_batch, points_with_features, tempera
             - 其他VRP变体组合
         add_prior: bool, default=False
             是否添加距离先验来增强邻接矩阵的连通性
+        test_mode: bool, default=False
+            是否为测试模式，影响对数概率的计算
+        distance_matrices: torch.Tensor, shape (batch_size, num_nodes, num_nodes)
+            距离矩阵，用于计算节点间实际距离
+        current_epoch: int, default=None
+            当前训练epoch，用于动态调整增强参数
+        max_epochs: int, default=None
+            最大训练epoch数，用于动态调整增强参数
     
     Returns:
         tours: torch.Tensor, shape (total_tours, max_tour_length)
@@ -532,7 +542,8 @@ def greedy_tsp_solver_batch_pomo(adj_matrix_batch, points_with_features, tempera
     """
     # 第一步：预处理和参数设置
     if add_prior:
-        adj_matrix_batch = enhance_adjacency_matrix(adj_matrix_batch)
+        adj_matrix_batch = enhance_adjacency_matrix(adj_matrix_batch, distance_matrices=distance_matrices, 
+                                                   current_epoch=current_epoch, max_epochs=max_epochs)
 
     batch_size, num_nodes, _ = adj_matrix_batch.shape
     device = adj_matrix_batch.device
@@ -610,7 +621,7 @@ def greedy_tsp_solver_batch_pomo(adj_matrix_batch, points_with_features, tempera
     tours[:, 0] = start_nodes  # 设置起始节点
     tour_lengths = torch.ones(total_tours, dtype=torch.long, device=device)  # 当前路径长度
     current_nodes = start_nodes.clone()  # 当前位置
-    log_probs = torch.zeros(total_tours, device=device)  # 累积对数概率
+    log_probs = torch.zeros(total_tours, device=device) if not test_mode else None  # 累积对数概率
     
     # 第五步：初始化节点访问跟踪
     if problem_type == "TSP":
@@ -647,6 +658,9 @@ def greedy_tsp_solver_batch_pomo(adj_matrix_batch, points_with_features, tempera
     # 第七步：主路径构建循环
     max_steps = max_tour_length - 2  # 预留空间给最终返回步骤
     
+    # 添加路径完成状态跟踪
+    finished_tours = torch.zeros(total_tours, dtype=torch.bool, device=device)
+    
     for step in range(max_steps):
         # 检查路径构建完成条件
         if problem_type == "TSP":
@@ -656,8 +670,14 @@ def greedy_tsp_solver_batch_pomo(adj_matrix_batch, points_with_features, tempera
         else:
             # VRP：检查是否所有客户节点都已被访问
             all_customers_visited = customer_visited_mask.all(dim=1)  # shape: (total_tours,)
-            if all_customers_visited.all():
-                break  # 所有实例都已访问完所有客户
+            
+            # 更新完成状态：当前在depot且所有客户已访问
+            at_depot = (current_nodes == 0)
+            newly_finished = at_depot & all_customers_visited & ~finished_tours
+            finished_tours = finished_tours | newly_finished
+            
+            if finished_tours.all():
+                break  # 所有实例都已完成
         
         # 获取当前节点到所有节点的边权重
         batch_indices = torch.arange(total_tours, device=device)
@@ -680,11 +700,11 @@ def greedy_tsp_solver_batch_pomo(adj_matrix_batch, points_with_features, tempera
                 visited_customers = customer_visited_mask[:, customer_idx]
                 ninf_mask[visited_customers, node_idx] = float('-inf')
             
-            # depot处理：如果在depot且所有客户已访问，则禁止留在depot
+            # depot处理：如果在depot且存在客户未访问，则禁止留在depot
             at_depot = (current_nodes == 0)
             all_customers_visited = customer_visited_mask.all(dim=1)
-            depot_and_done = at_depot & all_customers_visited
-            ninf_mask[depot_and_done, 0] = float('-inf')
+            depot_and_not_done = at_depot & ~all_customers_visited
+            ninf_mask[depot_and_not_done, 0] = float('-inf')
         
         # 第九步：应用VRP约束
         if problem_type != "TSP":
@@ -695,7 +715,7 @@ def greedy_tsp_solver_batch_pomo(adj_matrix_batch, points_with_features, tempera
                 ninf_mask[demand_too_large] = float('-inf')
             
             # 时间窗约束检查
-            if attribute_tw and expanded_early_tw is not None and expanded_late_tw is not None:
+            if attribute_tw:
                 # 计算到达各节点的时间
                 current_points = expanded_coords[batch_indices, current_nodes]  # 当前位置坐标
                 distances = torch.sqrt(torch.sum((current_points.unsqueeze(1) - expanded_coords) ** 2, dim=-1))
@@ -711,11 +731,11 @@ def greedy_tsp_solver_batch_pomo(adj_matrix_batch, points_with_features, tempera
             # 路径长度约束检查
             if attribute_l:
                 current_points = expanded_coords[batch_indices, current_nodes]
-                distances = torch.sqrt(torch.sum((current_points.unsqueeze(1) - expanded_coords) ** 2, dim=-1))
+                distances = torch.sqrt(torch.sum((current_points.unsqueeze(1) - expanded_coords) ** 2, dim=-1))  # (total_tours, num_nodes)
                 
                 if attribute_o:
                     # 开放路径：只需检查到目标节点的距离
-                    length_violations = remaining_lengths.unsqueeze(1) - round_error_epsilon < distances
+                    length_violations = remaining_lengths.unsqueeze(1) - round_error_epsilon < distances  # (total_tours, num_nodes)
                 else:
                     # 封闭路径：需要考虑返回depot的距离
                     depot_coords = expanded_coords[:, 0, :]  # depot坐标
@@ -733,12 +753,14 @@ def greedy_tsp_solver_batch_pomo(adj_matrix_batch, points_with_features, tempera
         # 开放路径特殊处理：确保depot始终可达以避免死锁
         if attribute_o:
             ninf_mask[:, 0] = 0.0  # depot永远可达
-            # 但如果当前在depot且所有客户已访问，则可以结束
-            if problem_type != "TSP":
-                at_depot = (current_nodes == 0)
-                all_customers_visited = customer_visited_mask.all(dim=1)
-                can_finish = at_depot & all_customers_visited
-                ninf_mask[can_finish, 0] = float('-inf')
+            # 但如果当前在depot且所有客户已访问，则这些路径已完成
+            # 不需要额外处理，因为已通过finished_tours跟踪
+        
+        # 关键修复：对于已完成的路径，提供一个安全的选择（保持在depot）
+        if problem_type != "TSP":
+            # 对于已完成的路径，只允许选择depot（保持当前位置）
+            ninf_mask[finished_tours, :] = float('-inf')  # 先屏蔽所有选择
+            ninf_mask[finished_tours, 0] = 0.0  # 只允许选择depot
         
         # 第十步：节点选择
         masked_edges = current_edges + ninf_mask
@@ -753,9 +775,17 @@ def greedy_tsp_solver_batch_pomo(adj_matrix_batch, points_with_features, tempera
             edge_probs = F.softmax(scaled_logits, dim=-1)
             next_nodes = torch.multinomial(edge_probs, num_samples=1).squeeze(-1)
         
-        # 计算并累积对数概率
-        selected_probs = edge_probs.gather(1, next_nodes.unsqueeze(1)).squeeze(1)
-        log_probs += torch.log(selected_probs + 1e-8)
+        # 现在edge_probs应该不会有NaN，-inf的边会有趋近于0的概率
+        # 但仍保留一个简单的安全检查以防万一
+        if torch.isnan(edge_probs).any():
+            print("Warning: NaN detected in edge_probs despite preprocessing")
+            edge_probs = torch.nan_to_num(edge_probs, nan=0.0, posinf=0.0, neginf=0.0)
+            edge_probs = edge_probs / (edge_probs.sum(dim=-1, keepdim=True) + 1e-8)
+        
+        if not test_mode:
+            # 计算并累积对数概率
+            selected_probs = edge_probs.gather(1, next_nodes.unsqueeze(1)).squeeze(1)
+            log_probs += torch.log(selected_probs + 1e-8)
         
         # 第十一步：更新路径和状态
         tours[batch_indices, tour_lengths] = next_nodes
@@ -820,7 +850,8 @@ def greedy_tsp_solver_batch_pomo(adj_matrix_batch, points_with_features, tempera
         # TSP：回到起始节点形成完整回路
         tours[batch_indices, tour_lengths] = start_nodes
         return_probs = expanded_adj[batch_indices, current_nodes, start_nodes]
-        log_probs += torch.log(return_probs + 1e-8)
+        if not test_mode:
+            log_probs += torch.log(return_probs + 1e-8)
         # 关键修复：更新tour_lengths以包含回到起点的节点
         tour_lengths += 1
     else:
@@ -829,7 +860,8 @@ def greedy_tsp_solver_batch_pomo(adj_matrix_batch, points_with_features, tempera
         if not_at_depot.any():
             tours[not_at_depot, tour_lengths[not_at_depot]] = 0
             return_probs = expanded_adj[not_at_depot, current_nodes[not_at_depot], 0]
-            log_probs[not_at_depot] += torch.log(return_probs + 1e-8)
+            if not test_mode:
+                log_probs[not_at_depot] += torch.log(return_probs + 1e-8)
             tour_lengths[not_at_depot] += 1
     
     # 第十三步：路径格式化和输出
@@ -865,6 +897,95 @@ def greedy_tsp_solver_batch_pomo(adj_matrix_batch, points_with_features, tempera
     # 可选：返回有效长度信息（如果需要的话）
     # valid_lengths_tensor = torch.tensor(valid_lengths, dtype=torch.long, device=device)
     # return tours, log_probs, valid_lengths_tensor
+    
+    return tours, log_probs
+
+
+def greedy_tsp_solver_batch_pomo(adj_matrix_batch, temperature=1.0):
+    """
+    POMO版本的批量TSP求解器，同时从所有节点作为起始点进行求解，支持探索
+    Args:
+        adj_matrix_batch: torch.Tensor of shape (batch_size, num_nodes, num_nodes) - 邻接矩阵批次
+        temperature: float - 控制探索程度的温度参数，越大越随机，越小越贪婪 (默认1.0)
+    Returns:
+        tours: torch.Tensor of shape (batch_size * num_nodes, num_nodes + 1) - 所有路径
+        log_probs: torch.Tensor of shape (batch_size * num_nodes,) - 每个路径的对数概率
+    """
+    batch_size, num_nodes, _ = adj_matrix_batch.shape
+    device = adj_matrix_batch.device
+    
+    # 扩展维度：为每个样本的每个节点作为起始点创建副本
+    # 从 (batch_size, num_nodes, num_nodes) 扩展为 (batch_size * num_nodes, num_nodes, num_nodes)
+    expanded_adj = adj_matrix_batch.unsqueeze(1).expand(-1, num_nodes, -1, -1)
+    expanded_adj = expanded_adj.reshape(batch_size * num_nodes, num_nodes, num_nodes)
+    
+    # 创建起始节点索引：[0,1,2,...,num_nodes-1, 0,1,2,...,num_nodes-1, ...]
+    start_nodes = torch.arange(num_nodes, device=device).repeat(batch_size)  # shape: (batch_size * num_nodes,)
+    
+    # 初始化路径
+    tours = torch.zeros(batch_size * num_nodes, num_nodes + 1, dtype=torch.long, device=device)
+    tours[:, 0] = start_nodes  # 设置起始节点
+    
+    # 当前节点位置
+    current_nodes = start_nodes.clone()
+    
+    # 累积对数概率
+    log_probs = torch.zeros(batch_size * num_nodes, device=device)
+    
+    # 初始化访问掩码（使用非原地操作的方式）
+    visited_mask = torch.zeros(batch_size * num_nodes, num_nodes, dtype=torch.bool, device=device)
+    # 使用非原地方式标记起始节点
+    start_mask = torch.zeros_like(visited_mask)
+    start_mask.scatter_(1, start_nodes.unsqueeze(1), True)
+    visited_mask = visited_mask | start_mask
+    
+    # 迭代构建路径
+    for step in range(num_nodes - 1):
+        # 获取当前节点到所有节点的边权重
+        batch_indices = torch.arange(batch_size * num_nodes, device=device)
+        current_edges = expanded_adj[batch_indices, current_nodes]  # shape: (batch_size * num_nodes, num_nodes)
+        
+        # 应用访问掩码：已访问节点设为负无穷
+        masked_edges = torch.where(visited_mask, 
+                                 torch.tensor(-float('inf'), device=device), 
+                                 current_edges)
+        
+        # 根据温度参数控制探索程度
+        if temperature <= 0.0:
+            # 温度为0或负数时使用纯贪婪选择
+            edge_probs = F.softmax(masked_edges, dim=-1)  # shape: (batch_size * num_nodes, num_nodes)
+            next_nodes = torch.argmax(masked_edges, dim=-1)  # shape: (batch_size * num_nodes,)
+        else:
+            # 使用温度参数调整logits以控制探索程度
+            scaled_logits = masked_edges / temperature
+            
+            # 计算概率分布
+            edge_probs = F.softmax(scaled_logits, dim=-1)  # shape: (batch_size * num_nodes, num_nodes)
+            
+            # 根据概率分布进行多项式采样，引入探索
+            next_nodes = torch.multinomial(edge_probs, num_samples=1).squeeze(-1)  # shape: (batch_size * num_nodes,)
+        
+        # 记录选择的对数概率
+        selected_probs = edge_probs.gather(1, next_nodes.unsqueeze(1)).squeeze(1)
+        log_probs += torch.log(selected_probs + 1e-8)
+        
+        # 更新路径
+        tours[:, step + 1] = next_nodes
+        
+        # 使用非原地操作更新访问掩码
+        next_mask = torch.zeros_like(visited_mask)
+        next_mask.scatter_(1, next_nodes.unsqueeze(1), True)
+        visited_mask = visited_mask | next_mask
+        
+        # 更新当前节点
+        current_nodes = next_nodes
+    
+    # 添加回到起始节点的路径
+    tours[:, -1] = start_nodes
+    
+    # 计算回到起始节点的对数概率
+    return_edges = expanded_adj[batch_indices, current_nodes, start_nodes]
+    log_probs += torch.log(return_edges + 1e-8)
     
     return tours, log_probs
 
@@ -914,7 +1035,7 @@ def calculate_tour_cost_batch_pomo(tours, distance_matrices, problem_type="TSP")
         expanded_distances = expanded_distances.reshape(total_tours, num_nodes, num_nodes)
     else:
         # VRP问题：需要考虑实际的起始节点数
-        actual_starts = num_nodes - 1 if num_nodes > 1 else num_nodes
+        actual_starts = num_nodes - 1 
         expanded_distances = distance_matrices.unsqueeze(1).expand(-1, actual_starts, -1, -1)
         expanded_distances = expanded_distances.reshape(total_tours, num_nodes, num_nodes)
     
@@ -973,11 +1094,76 @@ class TSPModel(COMetaModel):
                param_args=None):
     super(TSPModel, self).__init__(param_args=param_args, node_feature_only=False)
 
-    # ["TSP", "CVRP", "OVRP", "VRPB","VRPL", "VRPTW", "OVRPTW", "OVRPB", "VRPBL", "VRPBTW", "VRPLTW", "OVRPBL", "OVRPBTW", "OVRPLTW", "VRPBLTW", "OVRPBLTW"]
+    # ["TSP", "CVRP", "OVRP", "VRPB","VRPL", "VRPTW", "OVRPTW", "OVRPB", "VRPBL", "VRPBTW", "VRPLTW", "OVRPBL", "OVRPBTW", "OVRPLTW", "VRPBLTW", "OVRPBLTW", "hybrid"]
     self.problem_type = self.args.problem_type   # 获取问题类型
     self.add_prior = self.args.add_prior
 
-    if self.problem_type != "TSP":
+    # 处理混合任务
+    if self.problem_type == "hybrid":
+      # 混合任务：从配置文件中加载多个VRP变体
+      hybrid_configs = getattr(self.args, 'hybrid_configs', [])
+      if not hybrid_configs:
+        # 如果没有配置，使用默认配置
+        hybrid_configs = [
+          {
+            'data_file': os.path.join(self.args.storage_path, self.args.training_split.replace('train', 'cvrp_train')),
+            'problem_type': 'CVRP'
+          },
+          {
+            'data_file': os.path.join(self.args.storage_path, self.args.training_split.replace('train', 'vrptw_train')),
+            'problem_type': 'VRPTW'
+          },
+          {
+            'data_file': os.path.join(self.args.storage_path, self.args.training_split.replace('train', 'ovrp_train')),
+            'problem_type': 'OVRP'
+          }
+        ]
+      
+      # 检查数据文件是否存在，过滤掉不存在的文件
+      valid_configs = []
+      for config in hybrid_configs:
+        if os.path.exists(config['data_file']):
+          valid_configs.append(config)
+        else:
+          print(f"警告：数据文件不存在，跳过：{config['data_file']}")
+      
+      if not valid_configs:
+        raise ValueError("没有找到有效的混合训练数据文件")
+      
+      print(f"混合训练将使用 {len(valid_configs)} 种问题类型：{[c['problem_type'] for c in valid_configs]}")
+      
+      # 创建混合数据集
+      self.train_dataset = HybridGraphDataset(
+          data_configs=valid_configs,
+          sparse_factor=self.args.sparse_factor,
+          batch_size=self.args.batch_size
+      )
+      
+      # 对于测试和验证集，使用第一个配置的数据集类型
+      primary_type = valid_configs[0]['problem_type']
+      if primary_type == "TSP":
+        self.test_dataset = TSPGraphDataset(
+            data_file=os.path.join(self.args.storage_path, self.args.test_split),
+            sparse_factor=self.args.sparse_factor,
+        )
+        self.validation_dataset = TSPGraphDataset(
+            data_file=os.path.join(self.args.storage_path, self.args.validation_split),
+            sparse_factor=self.args.sparse_factor,
+        )
+      else:
+        self.test_dataset = VRPGraphDataset(
+            data_file=os.path.join(self.args.storage_path, self.args.test_split),
+            sparse_factor=self.args.sparse_factor,
+        )
+        self.validation_dataset = VRPGraphDataset(
+            data_file=os.path.join(self.args.storage_path, self.args.validation_split),
+            sparse_factor=self.args.sparse_factor,
+        )
+      
+      # 设置默认问题类型为第一个配置的类型（用于测试时）
+      self.default_problem_type = primary_type
+      
+    elif self.problem_type != "TSP":
       self.train_dataset = VRPGraphDataset(
           data_file=os.path.join(self.args.storage_path, self.args.training_split),
           sparse_factor=self.args.sparse_factor
@@ -1020,9 +1206,92 @@ class TSPModel(COMetaModel):
   def forward(self, x, adj, t, edge_index):
     return self.model(x, t, adj, edge_index)
 
+  def hybrid_collate_fn(self, batch):
+    """
+    自定义的collate函数，用于处理混合数据集的批次数据
+    """
+    # 混合数据集的批次包含问题类型信息
+    if len(batch[0]) == 5:  # (sample_idx, points, adj_matrix, tour, problem_type)
+      sample_indices, points, adj_matrices, tours, problem_types = zip(*batch)
+      
+      # 确保批次内的问题类型一致
+      unique_types = set(problem_types)
+      if len(unique_types) > 1:
+        print(f"警告：批次中包含多种问题类型：{unique_types}，使用第一个类型")
+      
+      batch_problem_type = problem_types[0]
+      
+      # 堆叠tensor
+      sample_indices = torch.stack(sample_indices)
+      points = torch.stack(points)
+      adj_matrices = torch.stack(adj_matrices)
+      tours = torch.stack(tours)
+      
+      return sample_indices, points, adj_matrices, tours, batch_problem_type
+    else:
+      # 标准数据集的批次处理
+      sample_indices, points, adj_matrices, tours = zip(*batch)
+      
+      sample_indices = torch.stack(sample_indices)
+      points = torch.stack(points)
+      adj_matrices = torch.stack(adj_matrices)
+      tours = torch.stack(tours)
+      
+      return sample_indices, points, adj_matrices, tours
+
+  def train_dataloader(self):
+    batch_size = self.args.batch_size
+    
+    # 对于混合数据集，使用自定义的collate函数
+    if self.problem_type == "hybrid":
+      from torch_geometric.data import DataLoader as GraphDataLoader
+      train_dataloader = GraphDataLoader(
+          self.train_dataset, 
+          batch_size=batch_size, 
+          shuffle=True,
+          num_workers=self.args.num_workers, 
+          pin_memory=True,
+          persistent_workers=True, 
+          drop_last=True,
+          collate_fn=self.hybrid_collate_fn
+      )
+    else:
+      # 标准数据集的处理
+      from torch_geometric.data import DataLoader as GraphDataLoader
+      train_dataloader = GraphDataLoader(
+          self.train_dataset, 
+          batch_size=batch_size, 
+          shuffle=True,
+          num_workers=self.args.num_workers, 
+          pin_memory=True,
+          persistent_workers=True, 
+          drop_last=True
+      )
+    
+    return train_dataloader
+
   def categorical_training_step(self, batch, batch_idx):
     edge_index = None
-    _, points, adj_matrix, gt_tour = batch
+    
+    # 处理混合数据集的批次数据
+    if self.problem_type == "hybrid":
+      # 混合数据集返回5个元素：sample_idx, points, adj_matrix, tour, problem_type
+      if len(batch) == 5:
+        _, points, adj_matrix, gt_tour, batch_problem_type = batch
+        # 对于混合训练，使用批次中的问题类型
+        current_problem_type = batch_problem_type[0] if isinstance(batch_problem_type, (list, tuple)) else batch_problem_type
+      else:
+        # 兼容性处理：如果批次格式不匹配，使用默认问题类型
+        _, points, adj_matrix, gt_tour = batch
+        current_problem_type = getattr(self, 'default_problem_type', 'CVRP')
+    else:
+      # 非混合数据集的标准处理
+      _, points, adj_matrix, gt_tour = batch
+      current_problem_type = self.problem_type
+    
+    # 记录当前批次的问题类型
+    self.log("train/problem_type", hash(current_problem_type) % 1000, on_step=True, on_epoch=False)
+    
     t = np.random.randint(1, self.diffusion.T + 1, points.shape[0]).astype(int)
 
     # Sample from diffusion
@@ -1065,41 +1334,36 @@ class TSPModel(COMetaModel):
         adj_prob_matrix = x0_pred_prob[:, :, :, 1]  # shape: (batch_size, num_nodes, num_nodes)
         
         try:
-            # 使用POMO版本的求解器获取路径和对数概率，支持探索 
-            pred_tours, log_probs = greedy_tsp_solver_batch_pomo(
-                adj_prob_matrix, temperature=self.pomo_temperature, 
-                points_with_features=points, problem_type=self.problem_type,
-                add_prior=self.add_prior
-            )
+            # 计算真实距离矩阵
+            distance_matrices = calculate_euclidean_distance_batch(points[:, :, :2])
+            # 使用POMO版本的求解器获取路径和对数概率，支持探索
+            # 使用当前批次的问题类型而不是模型的默认问题类型
+            pred_tours, log_probs = greedy_solver_batch_pomo(adj_prob_matrix, temperature=self.pomo_temperature, 
+                points_with_features=points, problem_type=current_problem_type,
+                add_prior=self.add_prior, distance_matrices=distance_matrices, test_mode=False,
+                current_epoch=self.current_epoch, max_epochs=self.trainer.max_epochs if self.trainer else None)
             # pred_tours: (batch_size * num_nodes, num_nodes + 1)
             # log_probs: (batch_size * num_nodes,)
             
-            # 计算真实距离矩阵
-            distance_matrices = calculate_euclidean_distance_batch(points[:, :, :2])
-            
             # 计算预测路径的成本
-            pred_costs = calculate_tour_cost_batch_pomo(pred_tours, distance_matrices, problem_type=self.problem_type)
+            pred_costs = calculate_tour_cost_batch_pomo(pred_tours, distance_matrices, problem_type=current_problem_type)   
             # pred_costs: (batch_size * num_nodes,)
             
             # 计算真实最优路径的成本作为基准
             gt_tours_list = []
             for b in range(points.shape[0]):
                 gt_tour_b = gt_tour[b].cpu().numpy().tolist()
-                if self.problem_type != "TSP":
-                    # 对于VRP问题，gt_tour可能需要特殊处理
-                    gt_tour_b.append(gt_tour_b[0])  # 添加回到起点（如果不是开放路径）
-                else:
-                    gt_tour_b.append(gt_tour_b[0])  # 添加回到起点
+                gt_tour_b.append(gt_tour_b[0])  # 添加回到起点
                 gt_tours_list.append(gt_tour_b)
             
             gt_costs = calculate_tour_cost_batch(gt_tours_list, distance_matrices)
             # gt_costs: (batch_size,)
             
             # 将gt_costs扩展以匹配POMO的维度
-            if self.problem_type == "TSP":
+            if current_problem_type == "TSP":
                 num_starts = points.shape[1] 
             else:
-                num_starts = points.shape[1] - 1 if points.shape[1] > 1 else points.shape[1]
+                num_starts = points.shape[1] - 1
             gt_costs_expanded = gt_costs.unsqueeze(1).expand(-1, num_starts).reshape(-1)
             # gt_costs_expanded: (batch_size * num_starts,)
             
@@ -1155,6 +1419,19 @@ class TSPModel(COMetaModel):
     # 记录扩散时间步信息
     avg_t = np.mean(np.random.randint(1, self.diffusion.T + 1, points.shape[0]).astype(int))
     self.log("train/avg_diffusion_timestep", avg_t, on_step=True, on_epoch=True, sync_dist=True)
+    
+    # 记录动态connectivity_boost值
+    if self.add_prior and self.current_epoch is not None and self.trainer and self.trainer.max_epochs:
+        # 计算当前的动态boost值（使用与enhance_adjacency_matrix相同的逻辑）
+        epoch_ratio = self.current_epoch / self.trainer.max_epochs
+        decay_rate = 3.0
+        initial_boost = 0.1  # 默认初始值
+        dynamic_boost = initial_boost * torch.exp(torch.tensor(-decay_rate * epoch_ratio))
+        min_boost = initial_boost * 0.01
+        dynamic_boost = max(dynamic_boost.item(), min_boost)
+        
+        self.log("train/connectivity_boost", dynamic_boost, on_step=True, on_epoch=True, sync_dist=True)
+        self.log("train/boost_decay_ratio", epoch_ratio, on_step=True, on_epoch=True, sync_dist=True)
     
     return total_loss
 
@@ -1296,58 +1573,58 @@ class TSPModel(COMetaModel):
       if self.args.save_numpy_heatmap:
         self.run_save_numpy_heatmap(adj_mat, np_points, real_batch_idx, split)
 
-    # 使用强化学习方法根据扩散模型预测的热力图生成TSP解决方案 
-    adj_prob_matrix = torch.from_numpy(adj_mat).float().to(device)
+      # 使用强化学习方法根据扩散模型预测的热力图生成TSP解决方案 
+      adj_prob_matrix = torch.from_numpy(adj_mat).float().to(device)
     
-    # 确保是单个样本的形状 (1, num_nodes, num_nodes)
-    if adj_prob_matrix.dim() == 2:
+      # 确保是单个样本的形状 (1, num_nodes, num_nodes)
+      if adj_prob_matrix.dim() == 2:
         adj_prob_matrix = adj_prob_matrix.unsqueeze(0)
     
-    # 使用POMO方法生成多个候选路径
-    use_pomo = getattr(self.args, 'use_pomo', True)  # 测试时默认使用POMO
-    test_temperature = getattr(self.args, 'test_temperature', 0.0)  # 测试时使用较小的温度以减少随机性 
+      # 使用POMO方法生成多个候选路径
+    #   use_pomo = getattr(self.args, 'use_pomo', False)  # 测试时默认使用POMO
+      test_temperature = getattr(self.args, 'test_temperature', 0)  # 测试时使用较小的温度以减少随机性 
     
-    # 使用POMO版本生成路径
-    points_tensor = torch.from_numpy(np_points).float().unsqueeze(0).to(device)  # (1, num_nodes, 2或7)
+      # 使用POMO版本生成路径
+      points_tensor = torch.from_numpy(np_points).float().unsqueeze(0).to(device)  # (1, num_nodes, 2或7)
     
-    # 检查并处理特征维度
-    if points_tensor.shape[-1] == 2:
-        # 只有2维坐标
-        if self.problem_type != "TSP":  
-            raise ValueError(f"VRP问题必须包含7维特征(坐标、需求、时间窗等)，当前只有{points_tensor.shape[-1]}维。" + 
+      # 检查并处理特征维度
+      if points_tensor.shape[-1] == 2:
+          # 只有2维坐标
+          if self.problem_type != "TSP":  
+              raise ValueError(f"VRP问题必须包含7维特征(坐标、需求、时间窗等)，当前只有{points_tensor.shape[-1]}维。" + 
                             "请检查数据集是否正确包含了所有必要的VRP约束特征。")
-        else: 
-            points_with_features = points_tensor
-    elif points_tensor.shape[-1] == 7:
-        # 已经有7维特征（VRP数据集），直接使用
-        points_with_features = points_tensor
-    else:
-        # 其他维度，报错
-        raise ValueError(f"不支持的特征维度: {points_tensor.shape[-1]}。期望2维（TSP）或7维（VRP）。")
+          else: 
+              points_with_features = points_tensor
+      elif points_tensor.shape[-1] == 7:
+          # 已经有7维特征（VRP数据集），直接使用
+          points_with_features = points_tensor
+      else:
+          # 其他维度，报错
+          raise ValueError(f"不支持的特征维度: {points_tensor.shape[-1]}。期望2维（TSP）或7维（VRP）。")
     
-    pred_tours, _ = greedy_tsp_solver_batch_pomo(
-                                                adj_prob_matrix, temperature=test_temperature, 
+      distance_matrices = calculate_euclidean_distance_batch(points_with_features[:, :, :2]) # 计算所有路径的成本
+      pred_tours, _ = greedy_solver_batch_pomo(adj_prob_matrix, temperature=test_temperature, 
                                                 points_with_features=points_with_features, 
                                                 problem_type=self.problem_type,
-                                                add_prior=self.add_prior
+                                                add_prior=self.add_prior,
+                                                test_mode=True,
+                                                distance_matrices=distance_matrices,
+                                                current_epoch=None, max_epochs=None  # 测试阶段不需要epoch信息
                                                 )
-    # pred_tours: (1 * num_nodes, num_nodes + 1) for TSP or (1 * (num_nodes-1), num_nodes + 1) for VRP
+      # pred_tours: (1 * num_nodes, num_nodes + 1) for TSP or (1 * (num_nodes-1), num_nodes + 1) for VRP
+      pred_costs = calculate_tour_cost_batch_pomo(pred_tours, distance_matrices, problem_type=self.problem_type)
     
-    # 计算所有路径的成本
-    distance_matrices = calculate_euclidean_distance_batch(points_with_features[:, :, :2])
-    pred_costs = calculate_tour_cost_batch_pomo(pred_tours, distance_matrices, problem_type=self.problem_type)
+      # 选择成本最小的路径
+      best_idx = torch.argmin(pred_costs)
+      best_tour = pred_tours[best_idx].cpu().numpy()
     
-    # 选择成本最小的路径
-    best_idx = torch.argmin(pred_costs)
-    best_tour = pred_tours[best_idx].cpu().numpy()
+      # 转换为列表格式，去掉最后的重复起始点
+      solved_tours = [best_tour[:-1].tolist()]
     
-    # 转换为列表格式，去掉最后的重复起始点
-    solved_tours = [best_tour[:-1].tolist()]
-    
-    # 转换为numpy数组
-    solved_tours = np.array(solved_tours, dtype='int64')
+      # 转换为numpy数组
+      solved_tours = np.array(solved_tours, dtype='int64')
 
-    stacked_tours.append(solved_tours)
+      stacked_tours.append(solved_tours)
 
     solved_tours = np.concatenate(stacked_tours, axis=0)
 
@@ -1359,184 +1636,21 @@ class TSPModel(COMetaModel):
     best_solved_cost = min(all_solved_costs)
 
     # 可视化对比真实路径和预测路径
-    debug_mode = False   # 临时启用以测试路径修复
-    if debug_mode:
-        # 直接使用已经从batch中获取的特征数据
-        # points_with_features 已经在前面从 points_tensor 获得，包含了正确的特征维度
-        current_features = points_with_features.cpu().numpy()[0] if points_with_features is not None else None
-        
-        # 获取路径数据
-        points = np_points[:, :2]  # shape: (num_nodes, 2) 
-        gt_path = np_gt_tour # shape: (num_nodes,)
-        pred_path = solved_tours[0]  # shape: (num_nodes,)
-        
-        # 确定保存路径
-        if hasattr(self.trainer, 'ckpt_path') and self.trainer.ckpt_path is not None:
-            ckpt_path = self.trainer.ckpt_path
-            exp_save_dir = os.path.dirname(os.path.dirname(ckpt_path))
-        else:
-            exp_save_dir = self.logger.log_dir if self.logger and hasattr(self.logger, 'log_dir') and self.logger.log_dir else './logs'
-            
-        vis_path = os.path.join(exp_save_dir, 'route_visualization')
-        os.makedirs(vis_path, exist_ok=True)
-        
-        # 构建文件名信息
-        model_info = f"v{getattr(self.logger, 'version', 'unknown')}_{getattr(self.logger, 'name', 'model')}"
-        use_pomo = getattr(self.args, 'use_pomo', True)
-        pomo_info = "pomo" if use_pomo else "greedy"
-        test_temp = getattr(self.args, 'test_temperature', 0.0)
-        
-        # 可视化预测路径
-        pred_filename = f'pred_route_{model_info}_{pomo_info}_temp{test_temp}_{split}_batch{batch_idx}.png'
-        pred_save_path = os.path.join(vis_path, pred_filename)
-        
-        title_suffix = f"{pomo_info.upper()}, temp={test_temp}"
-        
-        try:
-            fig_pred, execution_history = visualize_vrp_solution(
-                points=points,
-                tour=pred_path,
-                points_with_features=current_features,
-                problem_type=self.problem_type,
-                gt_cost=gt_cost,
-                pred_cost=best_solved_cost,
-                save_path=pred_save_path,
-                title_suffix=title_suffix,
-                show_constraints=True,
-                figsize=(15, 10)
-            )
-            plt.close(fig_pred)  # 关闭图形以释放内存
-            
-            # 从execution_history中获取约束违反信息
-            violations = execution_history['constraint_violations']
-            
-            # 记录约束违反信息
-            if violations['total_violations'] > 0:
-                print(f"⚠️  Solution has {violations['total_violations']} constraint violations:")
-                if violations['capacity_violations'] > 0:
-                    print(f"   - Capacity violations: {violations['capacity_violations']}")
-                if violations['time_window_violations'] > 0:
-                    print(f"   - Time window violations: {violations['time_window_violations']}")
-                if violations['length_violations'] > 0:
-                    print(f"   - Length violations: {violations['length_violations']}")
-                
-                # 记录详细的违反信息
-                print(f"📊 Execution Summary:")
-                print(f"   - Total steps: {len(execution_history['nodes']) - 1}")
-                print(f"   - Route segments: {len(execution_history['route_segments'])}")
-                print(f"   - Final load: {execution_history['loads'][-1] if execution_history['loads'] else 0:.3f}")
-                print(f"   - Final time: {execution_history['times'][-1] if execution_history['times'] else 0:.3f}")
-                print(f"   - Total distance: {execution_history['distances'][-1] if execution_history['distances'] else 0:.3f}")
-            else:
-                print("✅ Solution is feasible (no constraint violations)")
-                print(f"📊 Execution Summary:")
-                print(f"   - Total steps: {len(execution_history['nodes']) - 1}")
-                print(f"   - Route segments: {len(execution_history['route_segments'])}")
-                print(f"   - Final load: {execution_history['loads'][-1] if execution_history['loads'] else 0:.3f}")
-                print(f"   - Final time: {execution_history['times'][-1] if execution_history['times'] else 0:.3f}")
-                print(f"   - Total distance: {execution_history['distances'][-1] if execution_history['distances'] else 0:.3f}")
-            
-            # 如果有真实路径，也可视化对比
-            if gt_path is not None and len(gt_path) > 0:
-                gt_filename = f'gt_route_{model_info}_{split}_batch{batch_idx}.png'
-                gt_save_path = os.path.join(vis_path, gt_filename)
-                
-                fig_gt, _ = visualize_vrp_solution(
-                    points=points,
-                    tour=gt_path,
-                    points_with_features=current_features,
-                    problem_type=self.problem_type,
-                    pred_cost=gt_cost,
-                    save_path=gt_save_path,
-                    title_suffix="Ground Truth",
-                    show_constraints=True,
-                    figsize=(15, 10)
-                )
-                plt.close(fig_gt)
-                
-                # gt_violations = gt_execution_history['constraint_violations']
-                
-                # 创建对比图
-                comparison_filename = f'comparison_{model_info}_{pomo_info}_temp{test_temp}_{split}_batch{batch_idx}.png'
-                comparison_save_path = os.path.join(vis_path, comparison_filename)
-                
-                fig_comp, axes = plt.subplots(1, 2, figsize=(20, 8))
-                
-                # 左侧：真实路径
-                ax1 = axes[0]
-                ax1.scatter(points[:, 0], points[:, 1], c='lightblue', s=100, marker='o', 
-                           edgecolors='blue', linewidths=1, zorder=3)
-                if self.problem_type != "TSP":
-                    ax1.scatter(points[0, 0], points[0, 1], c='red', s=200, marker='s', 
-                               label='Depot', edgecolors='black', linewidths=2, zorder=5)
-                
-                for i in range(len(gt_path)):
-                    start = points[gt_path[i]]
-                    end = points[gt_path[(i + 1) % len(gt_path)]]
-                    ax1.plot([start[0], end[0]], [start[1], end[1]], 'r-', linewidth=2)
-                
-                ax1.set_title(f'Ground Truth (Cost: {gt_cost:.2f})', fontsize=14, fontweight='bold')
-                ax1.set_xlabel('X Coordinate')
-                ax1.set_ylabel('Y Coordinate')
-                ax1.grid(True, alpha=0.3)
-                ax1.set_aspect('equal', adjustable='box')
-                
-                # 右侧：预测路径
-                ax2 = axes[1]
-                ax2.scatter(points[:, 0], points[:, 1], c='lightblue', s=100, marker='o', 
-                           edgecolors='blue', linewidths=1, zorder=3)
-                if self.problem_type != "TSP":
-                    ax2.scatter(points[0, 0], points[0, 1], c='red', s=200, marker='s', 
-                               label='Depot', edgecolors='black', linewidths=2, zorder=5)
-                
-                for i in range(len(pred_path)):
-                    start = points[pred_path[i]]
-                    end = points[pred_path[(i + 1) % len(pred_path)]]
-                    ax2.plot([start[0], end[0]], [start[1], end[1]], 'g-', linewidth=2)
-                
-                gap = ((best_solved_cost - gt_cost) / gt_cost * 100) if gt_cost > 0 else 0
-                feasible_status = "feasible" if violations['total_violations'] == 0 else f"infeasible({violations['total_violations']})"
-                ax2.set_title(f'Prediction (Cost: {best_solved_cost:.2f}, Gap: {gap:.1f}%) {feasible_status}', 
-                             fontsize=14, fontweight='bold')
-                ax2.set_xlabel('X Coordinate')
-                ax2.set_ylabel('Y Coordinate')
-                ax2.grid(True, alpha=0.3)
-                ax2.set_aspect('equal', adjustable='box')
-                
-                plt.tight_layout()
-                plt.savefig(comparison_save_path, dpi=300, bbox_inches='tight')
-                plt.close(fig_comp)
-                
-                print(f"Comparison visualization saved to: {comparison_save_path}")
-                
-        except Exception as e:
-            print(f"VRP可视化失败: {e}")
-            # 回退到简单可视化
-            plt.rcParams['font.sans-serif'] = ['SimHei']  # 用来正常显示中文标签
-            plt.rcParams['axes.unicode_minus'] = False  # 用来正常显示负号
-            
-            fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
-            
-            # 绘制真实路径
-            ax1.scatter(points[:, 0], points[:, 1], c='blue', s=50)
-            for i in range(len(gt_path)):
-                start = points[gt_path[i]]
-                end = points[gt_path[(i + 1) % len(gt_path)]]
-                ax1.plot([start[0], end[0]], [start[1], end[1]], 'r-')
-            ax1.set_title(f'真实路径 (成本: {gt_cost:.2f})')
-            
-            # 绘制预测路径
-            ax2.scatter(points[:, 0], points[:, 1], c='blue', s=50)
-            for i in range(len(pred_path)):
-                start = points[pred_path[i]]
-                end = points[pred_path[(i + 1) % len(pred_path)]]
-                ax2.plot([start[0], end[0]], [start[1], end[1]], 'g-')
-            ax2.set_title(f'预测路径 (成本: {best_solved_cost:.2f})')
-            
-            fallback_filename = f'fallback_route_comparison_{model_info}_{pomo_info}_temp{test_temp}_{split}_batch{batch_idx}.png'
-            plt.savefig(os.path.join(vis_path, fallback_filename))
-            plt.close(fig)
-    
+    debug_visualize_route_comparison(
+        points_with_features=points_with_features,
+        np_points=np_points,
+        np_gt_tour=np_gt_tour,
+        solved_tours=solved_tours,
+        gt_cost=gt_cost,
+        best_solved_cost=best_solved_cost,
+        split=split,
+        batch_idx=batch_idx,
+        problem_type=self.problem_type,
+        trainer=self.trainer,
+        logger=self.logger,
+        args=self.args,
+        enable_debug=self.args.draw_route_comparison  # 设置为True以启用调试模式
+    )
 
     # 计算额外的性能指标
     gap_percentage = ((best_solved_cost - gt_cost) / gt_cost) * 100
@@ -1597,19 +1711,23 @@ class TSPModel(COMetaModel):
     return self.test_step(batch, batch_idx, split='val')
 
 
-def enhance_adjacency_matrix(adj_matrix, min_prob=0.01, connectivity_boost=0.1):
+def enhance_adjacency_matrix(adj_matrix, min_prob=0.01, connectivity_boost=0.9, distance_matrices=None, current_epoch=None, max_epochs=None):
     """
-    增强邻接矩阵的连通性，主要通过距离先验来改善低质量热力图
+    增强邻接矩阵的连通性，主要通过实际几何距离先验来改善低质量热力图
     
     当扩散模型训练初期输出的热力图质量较差时，这个函数可以：
     1. 确保所有边都有最小概率，避免完全断连
-    2. 基于节点索引距离增强近邻连接的概率（距离先验）
+    2. 基于实际几何距离增强近邻连接的概率（距离先验）
     3. 提高求解器找到完整路径的成功率
+    4. 随着训练进行，逐步减少对启发式信息的依赖
     
     Args:
         adj_matrix: torch.Tensor of shape (batch_size, num_nodes, num_nodes) - 原始邻接概率矩阵
         min_prob: float - 所有边的最小概率值，防止完全为0的边
-        connectivity_boost: float - 基于距离的连通性增强系数
+        connectivity_boost: float - 基于距离的连通性增强系数（初始值）
+        distance_matrices: torch.Tensor of shape (batch_size, num_nodes, num_nodes) - 距离矩阵，用于计算节点间实际距离
+        current_epoch: int - 当前训练epoch（可选）
+        max_epochs: int - 最大训练epoch数（可选）
     
     Returns:
         enhanced_matrix: torch.Tensor - 增强后的邻接矩阵
@@ -1619,26 +1737,87 @@ def enhance_adjacency_matrix(adj_matrix, min_prob=0.01, connectivity_boost=0.1):
     # 步骤1: 确保最小概率，避免求解器遇到完全不可达的节点
     enhanced = torch.clamp(enhanced, min=min_prob)
     
-    # 步骤2: 基于节点索引距离的先验增强
-    # 这是一个简单但有效的启发式：相邻索引的节点更可能在空间上接近
-    batch_size, num_nodes, _ = enhanced.shape
+    # 步骤2: 动态调整connectivity_boost参数
+    dynamic_boost = connectivity_boost
+    if current_epoch is not None and max_epochs is not None and max_epochs > 0:
+        # 使用指数衰减策略：boost = initial_boost * exp(-decay_rate * epoch_ratio)
+        # 这样可以在初期保持较高值，然后逐步减小
+        epoch_ratio = current_epoch / max_epochs
+        decay_rate = 2.0  # 衰减率，可以调整这个值来控制衰减速度
+        dynamic_boost = connectivity_boost * torch.exp(torch.tensor(-decay_rate * epoch_ratio))
+        
+        # 设置最小值，避免完全消失
+        min_boost = connectivity_boost * 0.01  # 保留初始值的1%作为最小值
+        dynamic_boost = max(dynamic_boost.item(), min_boost)
+        
+        # 添加调试信息（可选）
+        # if current_epoch % 10 == 0:  # 每10个epoch输出一次
+        #     print(f"[Epoch {current_epoch}/{max_epochs}] Connectivity boost: {connectivity_boost:.4f} → {dynamic_boost:.4f} (ratio: {epoch_ratio:.3f})")
+        
+        # 可选：使用线性衰减策略（注释掉指数衰减，取消注释这部分来使用）
+        # dynamic_boost = connectivity_boost * (1 - epoch_ratio)
+        
+        # 可选：使用余弦退火策略（注释掉指数衰减，取消注释这部分来使用）
+        # import math
+        # dynamic_boost = connectivity_boost * (1 + math.cos(math.pi * epoch_ratio)) / 2
     
-    for b in range(batch_size):
-        for i in range(num_nodes):
-            for j in range(num_nodes):
-                if i != j:
-                    # 计算节点索引距离的倒数作为先验权重
-                    # 索引距离越小，增强越多（假设索引相近的节点空间距离也相近）
-                    index_distance_factor = 1.0 / (abs(i - j) + 1)
-                    enhanced[b, i, j] += connectivity_boost * index_distance_factor
+    # 步骤3: 基于实际几何距离的先验增强
+    if distance_matrices is not None:
+        batch_size, num_nodes, _ = enhanced.shape
+        device = enhanced.device
+        
+        # 确保distance_matrices在同一设备上
+        if distance_matrices.device != device:
+            distance_matrices = distance_matrices.to(device)
+        
+        # 计算距离权重：距离越小，权重越大
+        # 使用负指数函数将距离转换为权重: exp(-distance/scale)
+        # 这样可以确保近距离节点获得更高的权重
+        
+        # 首先计算距离的统计信息以确定合适的缩放因子
+        # 排除对角线元素（自己到自己的距离为0）
+        mask = torch.eye(num_nodes, device=device).bool().unsqueeze(0).expand(batch_size, -1, -1)
+        masked_distances = distance_matrices.masked_select(~mask)
+        
+        # 使用距离的中位数或平均值作为缩放因子
+        distance_scale = masked_distances.median().item()
+        if distance_scale == 0:
+            distance_scale = 1.0  # 防止除零
+        
+        # 计算基于距离的权重
+        # 使用负指数函数：exp(-distance/scale)
+        distance_weights = torch.exp(-distance_matrices / distance_scale)
+        
+        # 将对角线元素设为0（节点到自己的增强权重为0）
+        diagonal_mask = torch.eye(num_nodes, device=device).bool().unsqueeze(0).expand(batch_size, -1, -1)
+        distance_weights[diagonal_mask] = 0
+        
+        # 应用动态调整后的距离权重增强
+        enhanced = (1-dynamic_boost) * enhanced + dynamic_boost * distance_weights
+        
+    else:
+        # 如果没有提供距离矩阵，回退到原来的索引距离方式
+        # 但这种情况应该避免，因为索引距离的假设通常不准确
+        print("警告：没有提供距离矩阵，回退到索引距离启发式")
+        batch_size, num_nodes, _ = enhanced.shape
+        
+        for b in range(batch_size):
+            for i in range(num_nodes):
+                for j in range(num_nodes):
+                    if i != j:
+                        # 计算节点索引距离的倒数作为先验权重
+                        # 索引距离越小，增强越多（假设索引相近的节点空间距离也相近）
+                        index_distance_factor = 1.0 / (abs(i - j) + 1)
+                        enhanced[b, i, j] += dynamic_boost * index_distance_factor
     
-    # 步骤3: 归一化到合理范围，避免概率过大
+    # 步骤4: 归一化到合理范围，避免概率过大
     enhanced = torch.clamp(enhanced, min=0, max=1)
     
     return enhanced
 
 
-def greedy_tsp_solver_batch(adj_matrix_batch, points_with_features, temperature=1.0, problem_type="TSP", add_prior=False):
+def greedy_tsp_solver_batch(adj_matrix_batch, points_with_features, temperature=1.0, problem_type="TSP", add_prior=False, 
+                           current_epoch=None, max_epochs=None):
     """
     非POMO版本的批量TSP/VRP求解器，每个样本只生成一个解，支持探索和VRP约束
     Args:
@@ -1646,12 +1825,15 @@ def greedy_tsp_solver_batch(adj_matrix_batch, points_with_features, temperature=
         temperature: float - 控制探索程度的温度参数，越大越随机，越小越贪婪 (默认1.0)
         points_with_features: torch.Tensor of shape (batch_size, num_nodes, 7) - 节点特征 [x, y, demand, early_tw, late_tw, route_open, length_limit]
         problem_type: str - 问题类型，用于确定约束
+        add_prior: bool - 是否添加距离先验来增强邻接矩阵的连通性
+        current_epoch: int - 当前训练epoch，用于动态调整增强参数
+        max_epochs: int - 最大训练epoch数，用于动态调整增强参数
     Returns:
         tours: torch.Tensor of shape (batch_size, max_tour_length) - 所有路径
         log_probs: torch.Tensor of shape (batch_size,) - 每个路径的对数概率
     """
     if add_prior:
-        adj_matrix_batch = enhance_adjacency_matrix(adj_matrix_batch)
+        adj_matrix_batch = enhance_adjacency_matrix(adj_matrix_batch, current_epoch=current_epoch, max_epochs=max_epochs)
 
     batch_size, num_nodes, _ = adj_matrix_batch.shape
     device = adj_matrix_batch.device
@@ -2035,369 +2217,212 @@ def calculate_tour_cost_batch_single(tours, distance_matrices, problem_type="TSP
     return costs
 
 
-def test_greedy_tsp_solver_batch_pomo():
+def debug_visualize_route_comparison(
+    points_with_features,
+    np_points,
+    np_gt_tour,
+    solved_tours,
+    gt_cost,
+    best_solved_cost,
+    split,
+    batch_idx,
+    problem_type,
+    trainer=None,
+    logger=None,
+    args=None,
+    enable_debug=False
+):
     """
-    测试 greedy_tsp_solver_batch_pomo 函数的正确性
-    包含TSP和VRP问题的多种测试场景
+    调试模式的路径可视化对比函数
+    
+    Args:
+        points_with_features: 包含特征的点数据
+        np_points: 点的坐标数据，shape: (num_nodes, 2)
+        np_gt_tour: 真实路径，shape: (num_nodes,)
+        solved_tours: 预测路径列表
+        gt_cost: 真实路径成本
+        best_solved_cost: 预测路径成本
+        split: 数据集分割（train/val/test）
+        batch_idx: 批次索引
+        problem_type: 问题类型
+        trainer: 训练器对象
+        logger: 日志记录器
+        args: 参数对象
+        enable_debug: 是否启用调试模式
     """
-    print("=" * 60)
-    print("开始测试 greedy_tsp_solver_batch_pomo 函数")
-    print("=" * 60)
+    if not enable_debug:
+        return
     
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"使用设备: {device}")
+    # 直接使用已经从batch中获取的特征数据
+    # points_with_features 已经在前面从 points_tensor 获得，包含了正确的特征维度
+    current_features = points_with_features.cpu().numpy()[0] if points_with_features is not None else None
     
-    # 测试1: TSP问题基础测试
-    def test_tsp_basic():
-        print("\n【测试1】TSP问题基础测试")
-        print("-" * 40)
-        
-        batch_size, num_nodes = 2, 5
-        # 创建简单的TSP测试数据
-        points = torch.rand(batch_size, num_nodes, 2, device=device) * 1  # 坐标在[0,10]范围内
-        
-        # 创建基于距离的邻接矩阵
-        adj_matrix = torch.zeros(batch_size, num_nodes, num_nodes, device=device)
-        for b in range(batch_size):
-            for i in range(num_nodes):
-                for j in range(num_nodes):
-                    if i != j:
-                        dist = torch.sqrt(torch.sum((points[b, i] - points[b, j]) ** 2))
-                        adj_matrix[b, i, j] = 1.0 / (dist + 0.1)  # 距离越近权重越大
-        
-        # 测试贪婪模式
-        tours, log_probs = greedy_tsp_solver_batch_pomo(
-            adj_matrix, points, temperature=0.0, problem_type="TSP"
-        )
-        
-        print(f"输入形状: points={points.shape}, adj_matrix={adj_matrix.shape}")
-        print(f"输出形状: tours={tours.shape}, log_probs={log_probs.shape}")
-        print(f"期望tours形状: ({batch_size * num_nodes}, {num_nodes + 1})")
-        
-        # 验证POMO扩展
-        expected_total_tours = batch_size * num_nodes
-        assert tours.shape[0] == expected_total_tours, f"POMO扩展错误: 期望{expected_total_tours}个tours，实际{tours.shape[0]}"
-        assert log_probs.shape[0] == expected_total_tours, f"log_probs数量错误"
-        
-        # 验证路径完整性
-        for i in range(min(5, tours.shape[0])):  # 检查前5个tours
-            tour = tours[i]
-            valid_tour = tour[tour >= 0]  # 移除填充的-1
-            unique_nodes = torch.unique(valid_tour[:-1])  # 除去最后回到起点的节点
-            print(f"Tour {i}: {valid_tour.cpu().numpy()}")
-            assert len(unique_nodes) == num_nodes, f"Tour {i} 未访问所有节点: 访问了{len(unique_nodes)}个，期望{num_nodes}个"
-            assert valid_tour[0] == valid_tour[-1], f"Tour {i} 未形成回路"
-        
-        print("✅ TSP基础测试通过")
+    # 获取路径数据
+    points = np_points[:, :2]  # shape: (num_nodes, 2) 
+    gt_path = np_gt_tour  # shape: (num_nodes,)
+    pred_path = solved_tours[0]  # shape: (num_nodes,)
     
-    # 测试2: VRP问题基础测试
-    def test_vrp_basic():
-        print("\n【测试2】VRP问题基础测试")
-        print("-" * 40)
+    # 确定保存路径
+    if trainer is not None and hasattr(trainer, 'ckpt_path') and trainer.ckpt_path is not None:
+        ckpt_path = trainer.ckpt_path
+        exp_save_dir = os.path.dirname(os.path.dirname(ckpt_path))
+    else:
+        exp_save_dir = logger.log_dir if logger and hasattr(logger, 'log_dir') and logger.log_dir else './logs'
         
-        batch_size, num_nodes = 1, 6  # 1个depot + 5个客户
-        
-        # 创建VRP测试数据 (7维特征)
-        points_with_features = torch.zeros(batch_size, num_nodes, 7, device=device)
-        
-        # 设置坐标
-        points_with_features[:, :, :2] = torch.rand(batch_size, num_nodes, 2, device=device) * 10
-        
-        # 设置需求 (depot需求为0，客户需求随机)
-        points_with_features[:, 0, 2] = 0  # depot需求为0
-        points_with_features[:, 1:, 2] = torch.rand(batch_size, num_nodes-1, device=device) * 0.3  # 客户需求
-        
-        # 设置时间窗 (简化版，不设置约束)
-        points_with_features[:, :, 3] = 0  # early_tw
-        points_with_features[:, :, 4] = 0  # late_tw (0表示无约束)
-        
-        # 设置路径长度限制
-        points_with_features[:, :, 6] = 15.0  # length_limit
-        
-        # 创建邻接矩阵
-        coords = points_with_features[:, :, :2]
-        adj_matrix = torch.zeros(batch_size, num_nodes, num_nodes, device=device)
-        for b in range(batch_size):
-            for i in range(num_nodes):
-                for j in range(num_nodes):
-                    if i != j:
-                        dist = torch.sqrt(torch.sum((coords[b, i] - coords[b, j]) ** 2))
-                        adj_matrix[b, i, j] = 1.0 / (dist + 0.1)
-        
-        # 测试CVRP
-        tours, log_probs = greedy_tsp_solver_batch_pomo(
-            adj_matrix, points_with_features, temperature=0.0, problem_type="CVRP"
-        )
-        
-        print(f"输入形状: points_with_features={points_with_features.shape}")
-        print(f"输出形状: tours={tours.shape}, log_probs={log_probs.shape}")
-        
-        # VRP的POMO应该从客户节点开始 (num_nodes-1个起始点)
-        expected_total_tours = batch_size * (num_nodes - 1) 
-        assert tours.shape[0] == expected_total_tours, f"VRP POMO扩展错误: 期望{expected_total_tours}个tours"
-        
-        # 验证客户节点访问完整性
-        for i in range(min(3, tours.shape[0])):
-            tour = tours[i]
-            valid_tour = tour[tour >= 0]
-            customer_visits = set()
-            for node in valid_tour:
-                if node > 0:  # 客户节点
-                    customer_visits.add(node.item())
-            
-            expected_customers = set(range(1, num_nodes))  # 客户节点1到num_nodes-1
-            print(f"VRP Tour {i}: {valid_tour.cpu().numpy()}")
-            print(f"  访问的客户: {sorted(customer_visits)}")
-            assert customer_visits == expected_customers, f"Tour {i} 客户访问不完整: {customer_visits} vs {expected_customers}"
-        
-        print("✅ VRP基础测试通过")
+    vis_path = os.path.join(exp_save_dir, 'route_visualization')
+    os.makedirs(vis_path, exist_ok=True)
     
-    # 测试3: 温度参数测试
-    def test_temperature_effects():
-        print("\n【测试3】温度参数效果测试")
-        print("-" * 40)
-        
-        batch_size, num_nodes = 1, 4
-        points = torch.rand(batch_size, num_nodes, 2, device=device) * 5
-        
-        # 创建邻接矩阵
-        adj_matrix = torch.ones(batch_size, num_nodes, num_nodes, device=device) * 0.5
-        for b in range(batch_size):
-            adj_matrix[b].fill_diagonal_(0)  # 对角线为0
-        
-        temperatures = [0.0, 0.5, 1.0, 2.0]
-        results = {}
-        
-        for temp in temperatures:
-            tours, log_probs = greedy_tsp_solver_batch_pomo(
-                adj_matrix, points, temperature=temp, problem_type="TSP"
-            )
-            
-            # 计算路径多样性 (不同路径的数量)
-            unique_tours = set()
-            for i in range(tours.shape[0]):
-                tour_tuple = tuple(tours[i].cpu().numpy())
-                unique_tours.add(tour_tuple)
-            
-            diversity = len(unique_tours)
-            results[temp] = {
-                'diversity': diversity,
-                'total_tours': tours.shape[0],
-                'avg_log_prob': log_probs.mean().item()
-            }
-            
-            print(f"温度 {temp}: 多样性={diversity}/{tours.shape[0]}, 平均log_prob={log_probs.mean().item():.4f}")
-        
-        # 验证温度效应：温度越高，多样性应该越高
-        diversities = [results[temp]['diversity'] for temp in temperatures]
-        print(f"多样性趋势: {diversities}")
-        
-        print("✅ 温度参数测试通过")
+    # 构建文件名信息
+    model_info = f"v{getattr(logger, 'version', 'unknown')}_{getattr(logger, 'name', 'model')}"
+    use_pomo = getattr(args, 'use_pomo', True) if args else True
+    pomo_info = "pomo" if use_pomo else "greedy"
+    test_temp = getattr(args, 'test_temperature', 0.0) if args else 0.0
     
-    # 测试4: 边界情况测试
-    def test_edge_cases():
-        print("\n【测试4】边界情况测试")
-        print("-" * 40)
-        
-        # 测试最小TSP (3个节点)
-        print("测试最小TSP问题 (3个节点)...")
-        points = torch.tensor([[[0, 0], [1, 0], [0, 1]]], dtype=torch.float, device=device)
-        adj_matrix = torch.ones(1, 3, 3, device=device)
-        adj_matrix[0].fill_diagonal_(0)
-        
-        tours, log_probs = greedy_tsp_solver_batch_pomo(
-            adj_matrix, points, temperature=0.0, problem_type="TSP"
-        )
-        
-        assert tours.shape[0] == 3, "最小TSP的POMO扩展错误"
-        print(f"最小TSP tours形状: {tours.shape}")
-        
-        # 测试单客户VRP (2个节点: depot + 1个客户)
-        print("测试单客户VRP问题...")
-        vrp_features = torch.zeros(1, 2, 7, device=device)
-        vrp_features[0, :, :2] = torch.tensor([[0, 0], [1, 1]], dtype=torch.float)  # 坐标
-        vrp_features[0, 1, 2] = 0.5  # 客户需求
-        vrp_features[0, :, 6] = 10.0  # 长度限制
-        
-        vrp_adj = torch.ones(1, 2, 2, device=device)
-        vrp_adj[0].fill_diagonal_(0)
-        
-        tours, log_probs = greedy_tsp_solver_batch_pomo(
-            vrp_adj, vrp_features, temperature=0.0, problem_type="CVRP"
-        )
-        
-        assert tours.shape[0] == 1, "单客户VRP的POMO扩展错误"  # 只有1个客户节点作为起始点
-        print(f"单客户VRP tours形状: {tours.shape}")
-        
-        print("✅ 边界情况测试通过")
+    # 可视化预测路径
+    pred_filename = f'pred_route_{model_info}_{pomo_info}_temp{test_temp}_{split}_batch{batch_idx}.png'
+    pred_save_path = os.path.join(vis_path, pred_filename)
     
-    # 测试5: 约束验证测试
-    def test_constraints_validation():
-        print("\n【测试5】VRP约束验证测试")
-        print("-" * 40)
-        
-        # 创建带严格约束的VRP问题
-        batch_size, num_nodes = 1, 4  # 1个depot + 3个客户
-        features = torch.zeros(batch_size, num_nodes, 7, device=device)
-        
-        # 设置坐标 (depot在中心，客户围绕)
-        features[0, 0, :2] = torch.tensor([5, 5])  # depot
-        features[0, 1, :2] = torch.tensor([1, 1])  # 客户1
-        features[0, 2, :2] = torch.tensor([9, 1])  # 客户2  
-        features[0, 3, :2] = torch.tensor([5, 9])  # 客户3
-        
-        # 设置需求 
-        features[0, 0, 2] = 0      # depot
-        features[0, 1, 2] = 0.3    # 客户1需求
-        features[0, 2, 2] = 0.4    # 客户2需求  
-        features[0, 3, 2] = 0.5    # 客户3需求
-        
-        # 设置时间窗 (客户2有严格时间窗)
-        features[0, :, 3] = 0      # early_tw都为0
-        features[0, :, 4] = 0      # late_tw都为0 (无约束)
-        features[0, 2, 4] = 100    # 客户2有晚期时间窗
-        
-        # 设置路径长度限制
-        features[0, :, 6] = 20.0
-        
-        # 创建距离基础的邻接矩阵
-        adj_matrix = torch.zeros(batch_size, num_nodes, num_nodes, device=device)
-        coords = features[:, :, :2]
-        for b in range(batch_size):
-            for i in range(num_nodes):
-                for j in range(num_nodes):
-                    if i != j:
-                        dist = torch.sqrt(torch.sum((coords[b, i] - coords[b, j]) ** 2))
-                        adj_matrix[b, i, j] = 1.0 / (dist + 0.1)
-        
-        # 测试带容量约束的VRP
-        tours, log_probs = greedy_tsp_solver_batch_pomo(
-            adj_matrix, features, temperature=0.0, problem_type="CVRP"
-        )
-        
-        print(f"约束测试tours形状: {tours.shape}")
-        
-        # 使用execute_vrp_simulation验证约束
-        for i in range(min(2, tours.shape[0])):
-            tour = tours[i].cpu().numpy()
-            # 移除填充值
-            valid_tour = tour[tour >= 0]
-            if len(valid_tour) > 1:
-                try:
-                    execution_history = simulate_vrp_execution(
-                        valid_tour, features[0].cpu().numpy(), "CVRP"
-                    )
-                    violations = execution_history['constraint_violations']['total_violations']
-                    print(f"Tour {i}: 长度={len(valid_tour)}, 约束违反={violations}")
-                    if violations > 0:
-                        print(f"  详细违反: {execution_history['constraint_violations']}")
-                except Exception as e:
-                    print(f"Tour {i} 验证失败: {e}")
-        
-        print("✅ 约束验证测试完成")
+    title_suffix = f"{pomo_info.upper()}, temp={test_temp}"
     
-    # 运行所有测试
     try:
-        # test_tsp_basic()
-        test_vrp_basic()  
-        test_constraints_validation()
+        fig_pred, execution_history = visualize_vrp_solution(
+            points=points,
+            tour=pred_path,
+            points_with_features=current_features,
+            problem_type=problem_type,
+            gt_cost=gt_cost,
+            pred_cost=best_solved_cost,
+            save_path=pred_save_path,
+            title_suffix=title_suffix,
+            show_constraints=True,
+            figsize=(15, 10)
+        )
+        plt.close(fig_pred)  # 关闭图形以释放内存
         
-        print("\n" + "=" * 60)
-        print("🎉 所有测试通过！greedy_tsp_solver_batch_pomo 函数工作正常")
-        print("=" * 60)
+        # 从execution_history中获取约束违反信息
+        violations = execution_history['constraint_violations']
         
+        # 记录约束违反信息
+        if violations['total_violations'] > 0:
+            print(f"⚠️  Solution has {violations['total_violations']} constraint violations:")
+            if violations['capacity_violations'] > 0:
+                print(f"   - Capacity violations: {violations['capacity_violations']}")
+            if violations['time_window_violations'] > 0:
+                print(f"   - Time window violations: {violations['time_window_violations']}")
+            if violations['length_violations'] > 0:
+                print(f"   - Length violations: {violations['length_violations']}")
+            
+            # 记录详细的违反信息
+            print(f"📊 Execution Summary:")
+            print(f"   - Total steps: {len(execution_history['nodes']) - 1}")
+            print(f"   - Route segments: {len(execution_history['route_segments'])}")
+            print(f"   - Final load: {execution_history['loads'][-1] if execution_history['loads'] else 0:.3f}")
+            print(f"   - Final time: {execution_history['times'][-1] if execution_history['times'] else 0:.3f}")
+            print(f"   - Total distance: {execution_history['distances'][-1] if execution_history['distances'] else 0:.3f}")
+        else:
+            print("✅ Solution is feasible (no constraint violations)")
+            print(f"📊 Execution Summary:")
+            print(f"   - Total steps: {len(execution_history['nodes']) - 1}")
+            print(f"   - Route segments: {len(execution_history['route_segments'])}")
+            print(f"   - Final load: {execution_history['loads'][-1] if execution_history['loads'] else 0:.3f}")
+            print(f"   - Final time: {execution_history['times'][-1] if execution_history['times'] else 0:.3f}")
+            print(f"   - Total distance: {execution_history['distances'][-1] if execution_history['distances'] else 0:.3f}")
+        
+        # 如果有真实路径，也可视化对比
+        if gt_path is not None and len(gt_path) > 0:
+            gt_filename = f'gt_route_{model_info}_{split}_batch{batch_idx}.png'
+            gt_save_path = os.path.join(vis_path, gt_filename)
+            
+            fig_gt, _ = visualize_vrp_solution(
+                points=points,
+                tour=gt_path,
+                points_with_features=current_features,
+                problem_type=problem_type,
+                pred_cost=gt_cost,
+                save_path=gt_save_path,
+                title_suffix="Ground Truth",
+                show_constraints=True,
+                figsize=(15, 10)
+            )
+            plt.close(fig_gt)
+            
+            # 创建对比图
+            comparison_filename = f'comparison_{model_info}_{pomo_info}_temp{test_temp}_{split}_batch{batch_idx}.png'
+            comparison_save_path = os.path.join(vis_path, comparison_filename)
+            
+            fig_comp, axes = plt.subplots(1, 2, figsize=(20, 8))
+            
+            # 左侧：真实路径
+            ax1 = axes[0]
+            ax1.scatter(points[:, 0], points[:, 1], c='lightblue', s=100, marker='o', 
+                       edgecolors='blue', linewidths=1, zorder=3)
+            if problem_type != "TSP":
+                ax1.scatter(points[0, 0], points[0, 1], c='red', s=200, marker='s', 
+                           label='Depot', edgecolors='black', linewidths=2, zorder=5)
+            
+            for i in range(len(gt_path)):
+                start = points[gt_path[i]]
+                end = points[gt_path[(i + 1) % len(gt_path)]]
+                ax1.plot([start[0], end[0]], [start[1], end[1]], 'r-', linewidth=2)
+            
+            ax1.set_title(f'Ground Truth (Cost: {gt_cost:.2f})', fontsize=14, fontweight='bold')
+            ax1.set_xlabel('X Coordinate')
+            ax1.set_ylabel('Y Coordinate')
+            ax1.grid(True, alpha=0.3)
+            ax1.set_aspect('equal', adjustable='box')
+            
+            # 右侧：预测路径
+            ax2 = axes[1]
+            ax2.scatter(points[:, 0], points[:, 1], c='lightblue', s=100, marker='o', 
+                       edgecolors='blue', linewidths=1, zorder=3)
+            if problem_type != "TSP":
+                ax2.scatter(points[0, 0], points[0, 1], c='red', s=200, marker='s', 
+                           label='Depot', edgecolors='black', linewidths=2, zorder=5)
+            
+            for i in range(len(pred_path)):
+                start = points[pred_path[i]]
+                end = points[pred_path[(i + 1) % len(pred_path)]]
+                ax2.plot([start[0], end[0]], [start[1], end[1]], 'g-', linewidth=2)
+            
+            gap = ((best_solved_cost - gt_cost) / gt_cost * 100) if gt_cost > 0 else 0
+            feasible_status = "feasible" if violations['total_violations'] == 0 else f"infeasible({violations['total_violations']})"
+            ax2.set_title(f'Prediction (Cost: {best_solved_cost:.2f}, Gap: {gap:.1f}%) {feasible_status}', 
+                         fontsize=14, fontweight='bold')
+            ax2.set_xlabel('X Coordinate')
+            ax2.set_ylabel('Y Coordinate')
+            ax2.grid(True, alpha=0.3)
+            ax2.set_aspect('equal', adjustable='box')
+            
+            plt.tight_layout()
+            plt.savefig(comparison_save_path, dpi=300, bbox_inches='tight')
+            plt.close(fig_comp)
+            
+            print(f"Comparison visualization saved to: {comparison_save_path}")
+            
     except Exception as e:
-        print(f"\n❌ 测试失败: {e}")
-        import traceback
-        traceback.print_exc()
-        return False
-    
-    return True
-
-
-def test_pomo_comparison():
-    """
-    比较POMO和非POMO方法的性能差异
-    """
-    print("\n" + "=" * 60) 
-    print("POMO vs 传统方法性能对比测试")
-    print("=" * 60)
-    
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    
-    # 创建测试问题
-    batch_size, num_nodes = 2, 8
-    points = torch.rand(batch_size, num_nodes, 2, device=device) * 10
-    
-    # 基于距离的邻接矩阵
-    adj_matrix = torch.zeros(batch_size, num_nodes, num_nodes, device=device)
-    for b in range(batch_size):
-        for i in range(num_nodes):
-            for j in range(num_nodes):
-                if i != j:
-                    dist = torch.sqrt(torch.sum((points[b, i] - points[b, j]) ** 2))
-                    adj_matrix[b, i, j] = 1.0 / (dist + 0.1)
-    
-    # 计算真实距离矩阵用于成本计算
-    distance_matrices = calculate_euclidean_distance_batch(points)
-    
-    print("测试TSP问题...")
-    
-    # POMO方法
-    print("\n1. POMO方法:")
-    tours_pomo, log_probs_pomo = greedy_tsp_solver_batch_pomo(
-        adj_matrix, points, temperature=0.0, problem_type="TSP"
-    )
-    costs_pomo = calculate_tour_cost_batch_pomo(tours_pomo, distance_matrices, "TSP")
-    
-    # 为每个原始样本选择最佳路径
-    costs_pomo_reshaped = costs_pomo.reshape(batch_size, num_nodes)
-    best_costs_pomo = costs_pomo_reshaped.min(dim=1)[0]
-    best_indices = costs_pomo_reshaped.argmin(dim=1)
-    
-    print(f"POMO生成路径数: {tours_pomo.shape[0]} ({batch_size} × {num_nodes})")
-    print(f"每个样本的最佳成本: {best_costs_pomo.cpu().numpy()}")
-    
-    # 传统方法 (非POMO版本) - 只从节点0开始
-    print("\n2. 传统方法 (单起始点):")
-    tours_traditional, log_probs_traditional = greedy_tsp_solver_batch(
-        adj_matrix, points, temperature=0.0, problem_type="TSP"
-    )
-    costs_traditional = calculate_tour_cost_batch_single(tours_traditional, distance_matrices, "TSP")
-    
-    print(f"传统方法生成路径数: {tours_traditional.shape[0]}")
-    print(f"传统方法成本: {costs_traditional.cpu().numpy()}")
-    
-    # 性能对比
-    print("\n3. 性能对比:")
-    improvement = ((costs_traditional - best_costs_pomo) / costs_traditional * 100)
-    print(f"POMO改进百分比: {improvement.cpu().numpy()}")
-    print(f"平均改进: {improvement.mean().item():.2f}%")
-    
-    # 显示最佳路径
-    print("\n4. 最佳路径示例:")
-    for b in range(batch_size):
-        best_idx = best_indices[b] + b * num_nodes
-        best_tour = tours_pomo[best_idx]
-        traditional_tour = tours_traditional[b]
+        print(f"VRP可视化失败: {e}")
+        # 回退到简单可视化
+        plt.rcParams['font.sans-serif'] = ['SimHei']  # 用来正常显示中文标签
+        plt.rcParams['axes.unicode_minus'] = False  # 用来正常显示负号
         
-        print(f"样本 {b}:")
-        print(f"  POMO最佳路径: {best_tour.cpu().numpy()}")
-        print(f"  传统路径:     {traditional_tour.cpu().numpy()}")
-        print(f"  成本对比: POMO={best_costs_pomo[b]:.3f} vs 传统={costs_traditional[b]:.3f}")
-    
-    print("\n✅ POMO对比测试完成")
-
-
-if __name__ == "__main__":
-    # 运行测试
-    print("开始运行 greedy_tsp_solver_batch_pomo 测试套件...")
-    
-    # 基础功能测试
-    success = test_greedy_tsp_solver_batch_pomo()
-    
-    if success:
-        # 性能对比测试
-        test_pomo_comparison()
-    
-    print("\n测试运行完成！")
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
+        
+        # 绘制真实路径
+        ax1.scatter(points[:, 0], points[:, 1], c='blue', s=50)
+        for i in range(len(gt_path)):
+            start = points[gt_path[i]]
+            end = points[gt_path[(i + 1) % len(gt_path)]]
+            ax1.plot([start[0], end[0]], [start[1], end[1]], 'r-')
+        ax1.set_title(f'真实路径 (成本: {gt_cost:.2f})')
+        
+        # 绘制预测路径
+        ax2.scatter(points[:, 0], points[:, 1], c='blue', s=50)
+        for i in range(len(pred_path)):
+            start = points[pred_path[i]]
+            end = points[pred_path[(i + 1) % len(pred_path)]]
+            ax2.plot([start[0], end[0]], [start[1], end[1]], 'g-')
+        ax2.set_title(f'预测路径 (成本: {best_solved_cost:.2f})')
+        
+        fallback_filename = f'fallback_route_comparison_{model_info}_{pomo_info}_temp{test_temp}_{split}_batch{batch_idx}.png'
+        plt.savefig(os.path.join(vis_path, fallback_filename))
+        plt.close(fig)

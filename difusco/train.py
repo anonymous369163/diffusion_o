@@ -94,6 +94,7 @@ def arg_parser():
   parser.add_argument('--no_debug', action='store_true', default=False)
   parser.add_argument('--problem_type', type=str, default='TSP')
   parser.add_argument('--add_prior', action='store_true', default=False)
+  parser.add_argument('--draw_route_comparison', action='store_true', default=False)
 
   args = parser.parse_args()
   return args

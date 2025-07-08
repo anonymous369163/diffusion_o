@@ -10,7 +10,7 @@ export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
 cd "$(dirname "$0")"
 
 python -u difusco/train.py \
-  --task "tsp" \
+  --task "ovrpbltw" \
   --diffusion_type "categorical" \
   --learning_rate 0.0002 \
   --weight_decay 0.0001 \
@@ -29,11 +29,13 @@ python -u difusco/train.py \
   --do_train \
   --do_test \
   --no_debug \
-  --logger_name "tsp_test_77" \
-  --problem_type "TSP" \
-  --training_split "data/tsp/tsp50_train_concorde.txt" \
-  --validation_split "data/tsp/tsp50_test_concorde.txt" \
-  --test_split "data/tsp/tsp50_test_concorde.txt" \
+  --add_prior \
+  --logger_name "ovrpbltw_test_77" \
+  --problem_type "OVRPBLTW" \
+  --training_split "data/vrp/OVRPBLTW50.pkl" \
+  --validation_split "data/vrp/OVRPBLTW50.pkl" \
+  --test_split "data/vrp/OVRPBLTW50.pkl" \
+  --draw_route_comparison 
 
 # ["TSP", "CVRP", "OVRP", "VRPB","VRPL", "VRPTW", "OVRPTW", "OVRPB", "VRPBL", "VRPBTW", "VRPLTW", "OVRPBL", "OVRPBTW", "OVRPLTW", "VRPBLTW", "OVRPBLTW"]
 # tensorboard --logdir=./tb_logs &
