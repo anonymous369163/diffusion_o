@@ -1,0 +1,16 @@
+scripts
+.idea
+*.png
+*.gif
+/tb_logs
+*.txt
+*.pyc
+*.Identifier 
+/saved_models 
+ 
+*.pkl 
+MTNCO/
+tb_logs/
+pyconcorde/
+.vscode/
+.history/
