@@ -146,3 +146,110 @@ class VRPGraphDataset(torch.utils.data.Dataset):
       # Return a sparse graph where each node is connected to its k nearest neighbors
       # k = self.sparse_factor
       raise NotImplementedError("Sparse graph is not supported for VRP")
+
+
+class SingleCaseVRPGraphDataset(torch.utils.data.Dataset):
+  """
+  单案例VRP数据集 - 只加载第一个案例并复制多份
+  用于测试算法在单个案例上的学习能力
+  """
+  def __init__(self, data_file, sparse_factor=-1, num_copies=1000):
+    self.data_file = data_file
+    self.sparse_factor = sparse_factor
+    self.num_copies = num_copies
+    
+    # 加载原始数据
+    with open(data_file, 'rb') as f:
+      original_data = pickle.load(f)
+    
+    # 数据结构：每个key对应的value是list，每个list包含多个批次
+    # 每个批次包含500个案例，我们要取第一个批次的第一个案例
+    batch_idx = 0  # 使用第一个批次
+    case_idx = 0   # 使用第一个案例
+    
+    # 直接提取第一个案例的数据
+    self.single_case = {
+        "depot_xy": original_data["depot_xy"][batch_idx][case_idx],    # shape: (1, 2)
+        "node_xy": original_data["node_xy"][batch_idx][case_idx],      # shape: (50, 2)
+        "node_demand": original_data["node_demand"][batch_idx][case_idx],  # shape: (50,)
+        "node_earlyTW": original_data["node_earlyTW"][batch_idx][case_idx],  # shape: (50,)
+        "node_lateTW": original_data["node_lateTW"][batch_idx][case_idx],    # shape: (50,)
+        "route_open": original_data["route_open"][batch_idx][case_idx],      # shape: (50,)
+        "length": original_data["length"][batch_idx][case_idx],              # shape: (50,)
+        "tours": original_data["tours"][batch_idx][case_idx]                 # shape: (61,)
+    }
+    
+    print(f'加载单个案例从 "{data_file}" 并复制 {num_copies} 份')
+    print(f'原始数据集包含 {len(original_data["depot_xy"])} 个批次，每个批次 {len(original_data["depot_xy"][0])} 个案例')
+    print(f'单案例数据集将包含 {num_copies} 个相同的案例')
+    
+    # 打印第一个案例的基本信息
+    print(f'案例信息:')
+    print(f'  - 仓库坐标形状: {np.array(self.single_case["depot_xy"]).shape}')
+    print(f'  - 节点坐标形状: {np.array(self.single_case["node_xy"]).shape}')
+    print(f'  - 需求形状: {np.array(self.single_case["node_demand"]).shape}')
+    print(f'  - 路径形状: {np.array(self.single_case["tours"]).shape}')
+    print(f'  - 仓库坐标: {self.single_case["depot_xy"]}')
+    print(f'  - 路径: {self.single_case["tours"]}')
+
+  def __len__(self):
+    return self.num_copies
+
+  def get_example(self, idx):
+    # 无论idx是什么，都返回第一个案例
+    depot_xy = self.single_case["depot_xy"]
+    node_xy = self.single_case["node_xy"]
+    node_demand = self.single_case["node_demand"]
+    node_earlyTW = self.single_case["node_earlyTW"]
+    node_lateTW = self.single_case["node_lateTW"]
+    route_open = self.single_case["route_open"]
+    length = self.single_case["length"]
+    solutions = self.single_case["tours"]
+
+    # 确保数据是numpy数组格式（实际上它们已经是了）
+    depot_xy = np.array(depot_xy)      # shape: (1, 2)
+    node_xy = np.array(node_xy)        # shape: (50, 2)
+    node_demand = np.array(node_demand)    # shape: (50,)
+    node_earlyTW = np.array(node_earlyTW)  # shape: (50,)
+    node_lateTW = np.array(node_lateTW)    # shape: (50,)
+    route_open = np.array(route_open)      # shape: (50,)
+    length = np.array(length)              # shape: (50,)
+    solutions = np.array(solutions)        # shape: (61,)
+
+    # 给depot添加额外的属性维度，使其与node特征维度匹配
+    # depot_xy: (1, 2) -> (1, 7)
+    depot_xy = np.concatenate([depot_xy, np.zeros((1, 5))], axis=1)
+    
+    # 给node添加特征维度
+    # node_xy: (50, 2), 其他特征: (50,) -> (50, 7)
+    points = np.concatenate([node_xy,
+                             node_demand.reshape(-1, 1),
+                             node_earlyTW.reshape(-1, 1),
+                             node_lateTW.reshape(-1, 1),
+                             route_open.reshape(-1, 1),
+                             length.reshape(-1, 1)], axis=1)
+    
+    # 合并depot和node，形成完整的点集
+    # depot_xy: (1, 7) + points: (50, 7) -> (51, 7)
+    points = np.concatenate([depot_xy, points], axis=0)
+    tour = solutions
+    return points, tour
+
+  def __getitem__(self, idx):
+    points, tour = self.get_example(idx)
+    if self.sparse_factor <= 0:
+      # Return a densely connected graph
+      adj_matrix = np.zeros((points.shape[0], points.shape[0]))
+      for i in range(tour.shape[0] - 1):
+        adj_matrix[tour[i], tour[i + 1]] = 1
+      # return points, adj_matrix, tour
+      return (
+          torch.LongTensor(np.array([idx], dtype=np.int64)),
+          torch.from_numpy(points).float(),
+          torch.from_numpy(adj_matrix).float(),
+          torch.from_numpy(tour).long(),
+      )
+    else:   
+      # Return a sparse graph where each node is connected to its k nearest neighbors
+      # k = self.sparse_factor
+      raise NotImplementedError("Sparse graph is not supported for VRP")

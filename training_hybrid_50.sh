@@ -11,7 +11,7 @@ cd "$(dirname "$0")"
 
 # 你可以在这里修改要使用的问题类型
 # 支持的问题类型: CVRP VRPTW OVRP VRPB VRPL OVRPTW OVRPB VRPBL VRPBTW VRPLTW OVRPBL OVRPBTW OVRPLTW VRPBLTW OVRPBLTW
-PROBLEM_TYPES="CVRP VRPTW OVRP VRPB VRPL"
+PROBLEM_TYPES="CVRP VRPL"
 
 # 如果通过命令行参数指定了问题类型，则使用命令行参数
 if [ $# -gt 0 ]; then

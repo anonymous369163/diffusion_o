@@ -58,7 +58,7 @@ def arg_parser():
   parser.add_argument('--weight_decay', type=float, default=1e-4)
   parser.add_argument('--lr_scheduler', type=str, default='cosine-decay')
 
-  parser.add_argument('--num_workers', type=int, default=1)   # o:16
+  parser.add_argument('--num_workers', type=int, default=16)   # o:16
   parser.add_argument('--fp16', action='store_true')
   parser.add_argument('--use_activation_checkpoint', action='store_true')
 
@@ -101,6 +101,12 @@ def arg_parser():
   # 添加新的参数用于指定混合训练的问题类型
   parser.add_argument('--hybrid_problem_types', type=str, nargs='+', default=None,
                       help='List of problem types for hybrid training (e.g., CVRP VRPTW OVRP)')
+  
+  # 添加单案例模式的参数
+  parser.add_argument('--single_case_mode', action='store_true', default=False,
+                      help='Use single case mode - only load the first case and replicate it')
+  parser.add_argument('--single_case_copies', type=int, default=1000,
+                      help='Number of copies of the single case to create (default: 1000)')
 
   args = parser.parse_args()
   return args

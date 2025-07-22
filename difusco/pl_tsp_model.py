@@ -59,11 +59,347 @@ import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 from matplotlib.colors import LinearSegmentedColormap
 
-from co_datasets.tsp_graph_dataset import TSPGraphDataset, VRPGraphDataset
+from co_datasets.tsp_graph_dataset import TSPGraphDataset, VRPGraphDataset, SingleCaseVRPGraphDataset
 from co_datasets.hybrid_graph_dataset import HybridGraphDataset
 from pl_meta_model import COMetaModel
 from utils.diffusion_schedulers import InferenceSchedule
 from utils.tsp_utils import TSPEvaluator  # , batched_two_opt_torch, merge_tours  # 注释掉因为改用强化学习方法
+
+
+
+def enhance_adjacency_matrix(adj_matrix, min_prob=0.01, connectivity_boost=0.3, distance_matrices=None):
+    """
+    增强邻接矩阵的连通性，主要通过实际几何距离先验来改善低质量热力图
+    
+    当扩散模型训练初期输出的热力图质量较差时，这个函数可以：
+    1. 确保所有边都有最小概率，避免完全断连
+    2. 基于实际几何距离增强近邻连接的概率（距离先验）
+    3. 提高求解器找到完整路径的成功率
+    4. 随着训练进行，逐步减少对启发式信息的依赖
+    
+    Args:
+        adj_matrix: torch.Tensor of shape (batch_size, num_nodes, num_nodes) - 原始邻接概率矩阵
+        min_prob: float - 所有边的最小概率值，防止完全为0的边
+        connectivity_boost: float - 基于距离的连通性增强系数（初始值）
+        distance_matrices: torch.Tensor of shape (batch_size, num_nodes, num_nodes) - 距离矩阵，用于计算节点间实际距离
+        current_epoch: int - 当前训练epoch（可选）
+        max_epochs: int - 最大训练epoch数（可选）
+    
+    Returns:
+        enhanced_matrix: torch.Tensor - 增强后的邻接矩阵
+    """
+    enhanced = adj_matrix.clone()
+    
+    # 步骤1: 确保最小概率，避免求解器遇到完全不可达的节点
+    enhanced = torch.clamp(enhanced, min=min_prob)
+    
+    # 步骤2: 动态调整connectivity_boost参数
+    dynamic_boost = connectivity_boost
+    
+    # 步骤3: 基于实际几何距离的先验增强
+    if distance_matrices is not None:
+        batch_size, num_nodes, _ = enhanced.shape
+        device = enhanced.device
+        
+        # 确保distance_matrices在同一设备上
+        if distance_matrices.device != device:
+            distance_matrices = distance_matrices.to(device) 
+        
+        # 首先计算距离的统计信息以确定合适的缩放因子
+        # 排除对角线元素（自己到自己的距离为0）
+        mask = torch.eye(num_nodes, device=device).bool().unsqueeze(0).expand(batch_size, -1, -1)
+        masked_distances = distance_matrices.masked_select(~mask)
+        
+        # 使用距离的中位数或平均值作为缩放因子
+        distance_scale = masked_distances.median().item()
+        if distance_scale == 0:
+            distance_scale = 1.0  # 防止除零
+        
+        # 计算基于距离的权重
+        # 使用负指数函数：exp(-distance/scale)
+        distance_weights = torch.exp(-distance_matrices / distance_scale)
+        
+        # 将对角线元素设为0（节点到自己的增强权重为0）
+        diagonal_mask = torch.eye(num_nodes, device=device).bool().unsqueeze(0).expand(batch_size, -1, -1)
+        distance_weights[diagonal_mask] = 0
+        
+        # 应用动态调整后的距离权重增强
+        enhanced = (1-dynamic_boost) * enhanced + dynamic_boost * distance_weights
+        
+    else:
+        # 如果没有提供距离矩阵，回退到原来的索引距离方式
+        # 但这种情况应该避免，因为索引距离的假设通常不准确
+        print("警告：没有提供距离矩阵，回退到索引距离启发式")
+        batch_size, num_nodes, _ = enhanced.shape
+        
+        for b in range(batch_size):
+            for i in range(num_nodes):
+                for j in range(num_nodes):
+                    if i != j:
+                        # 计算节点索引距离的倒数作为先验权重
+                        # 索引距离越小，增强越多（假设索引相近的节点空间距离也相近）
+                        index_distance_factor = 1.0 / (abs(i - j) + 1)
+                        enhanced[b, i, j] += dynamic_boost * index_distance_factor
+    
+    # 步骤4: 归一化到合理范围，避免概率过大
+    enhanced = torch.clamp(enhanced, min=0, max=1)
+    
+    return enhanced
+
+
+def calculate_tour_cost_batch_single(tours, distance_matrices, problem_type="TSP"):
+    """
+    非POMO版本的批量路径成本计算，支持开放路径，每个样本只有一个路径
+    Args:
+        tours: torch.Tensor of shape (batch_size, max_tour_length) - 路径张量
+        distance_matrices: torch.Tensor of shape (batch_size, num_nodes, num_nodes) - 距离矩阵
+        problem_type: str - 问题类型，用于确定是否为开放路径
+    Returns:
+        costs: torch.Tensor of shape (batch_size,) - 每个路径的成本
+    """
+    batch_size, _ = tours.shape
+    device = tours.device
+    
+    # 确定是否为开放路径
+    attribute_o = 'O' in problem_type and problem_type.startswith('O')
+    
+    # 计算路径成本
+    costs = torch.zeros(batch_size, device=device)
+    
+    # 使用张量操作计算所有路径段的成本
+    for i in range(tours.shape[1] - 1):  # max_tour_length - 1 个路径段
+        current_nodes = tours[:, i]      # shape: (batch_size,)
+        next_nodes = tours[:, i + 1]     # shape: (batch_size,)
+        
+        # 跳过填充的部分（值为-1或0的无效段）
+        valid_segments = (current_nodes >= 0) & (next_nodes >= 0) & (current_nodes != next_nodes)
+        
+        if valid_segments.any():
+            # 获取对应的距离
+            batch_indices = torch.arange(batch_size, device=device)
+            segment_costs = distance_matrices[batch_indices, current_nodes, next_nodes]
+            
+            # 对于开放路径（O属性），如果下一个节点是depot（通常是节点0），则距离设为0
+            if attribute_o:
+                is_return_to_depot = (next_nodes == 0)
+                segment_costs[is_return_to_depot] = 0
+            
+            # 只累加有效路径段的成本
+            costs[valid_segments] += segment_costs[valid_segments]
+    
+    return costs
+
+
+def debug_visualize_route_comparison(
+    points_with_features,
+    np_points,
+    np_gt_tour,
+    solved_tours,
+    gt_cost,
+    best_solved_cost,
+    split,
+    batch_idx,
+    problem_type,
+    trainer=None,
+    logger=None,
+    args=None,
+    enable_debug=False
+):
+    """
+    调试模式的路径可视化对比函数
+    
+    Args:
+        points_with_features: 包含特征的点数据
+        np_points: 点的坐标数据，shape: (num_nodes, 2)
+        np_gt_tour: 真实路径，shape: (num_nodes,)
+        solved_tours: 预测路径列表
+        gt_cost: 真实路径成本
+        best_solved_cost: 预测路径成本
+        split: 数据集分割（train/val/test）
+        batch_idx: 批次索引
+        problem_type: 问题类型
+        trainer: 训练器对象
+        logger: 日志记录器
+        args: 参数对象
+        enable_debug: 是否启用调试模式
+    """
+    if not enable_debug:
+        return
+    
+    # 直接使用已经从batch中获取的特征数据
+    # points_with_features 已经在前面从 points_tensor 获得，包含了正确的特征维度
+    current_features = points_with_features.cpu().numpy()[0] if points_with_features is not None else None
+    
+    # 获取路径数据
+    points = np_points[:, :2]  # shape: (num_nodes, 2) 
+    gt_path = np_gt_tour  # shape: (num_nodes,)
+    pred_path = solved_tours[0]  # shape: (num_nodes,)
+    
+    # 确定保存路径
+    if trainer is not None and hasattr(trainer, 'ckpt_path') and trainer.ckpt_path is not None:
+        ckpt_path = trainer.ckpt_path
+        exp_save_dir = os.path.dirname(os.path.dirname(ckpt_path))
+    else:
+        exp_save_dir = logger.log_dir if logger and hasattr(logger, 'log_dir') and logger.log_dir else './logs'
+        
+    vis_path = os.path.join(exp_save_dir, 'route_visualization')
+    os.makedirs(vis_path, exist_ok=True)
+    
+    # 构建文件名信息
+    model_info = f"v{getattr(logger, 'version', 'unknown')}_{getattr(logger, 'name', 'model')}"
+    use_pomo = getattr(args, 'use_pomo', True) if args else True
+    pomo_info = "pomo" if use_pomo else "greedy"
+    test_temp = getattr(args, 'test_temperature', 0.0) if args else 0.0
+    
+    # 可视化预测路径
+    pred_filename = f'pred_route_{model_info}_{pomo_info}_temp{test_temp}_{split}_batch{batch_idx}.png'
+    pred_save_path = os.path.join(vis_path, pred_filename)
+    
+    title_suffix = f"{pomo_info.upper()}, temp={test_temp}"
+    
+    try:
+        fig_pred, execution_history = visualize_vrp_solution(
+            points=points,
+            tour=pred_path,
+            points_with_features=current_features,
+            problem_type=problem_type,
+            gt_cost=gt_cost,
+            pred_cost=best_solved_cost,
+            save_path=pred_save_path,
+            title_suffix=title_suffix,
+            show_constraints=True,
+            figsize=(15, 10)
+        )
+        plt.close(fig_pred)  # 关闭图形以释放内存
+        
+        # 从execution_history中获取约束违反信息
+        violations = execution_history['constraint_violations']
+        
+        # 记录约束违反信息
+        if violations['total_violations'] > 0:
+            print(f"⚠️  Solution has {violations['total_violations']} constraint violations:")
+            if violations['capacity_violations'] > 0:
+                print(f"   - Capacity violations: {violations['capacity_violations']}")
+            if violations['time_window_violations'] > 0:
+                print(f"   - Time window violations: {violations['time_window_violations']}")
+            if violations['length_violations'] > 0:
+                print(f"   - Length violations: {violations['length_violations']}")
+            
+            # 记录详细的违反信息
+            print(f"📊 Execution Summary:")
+            print(f"   - Total steps: {len(execution_history['nodes']) - 1}")
+            print(f"   - Route segments: {len(execution_history['route_segments'])}")
+            print(f"   - Final load: {execution_history['loads'][-1] if execution_history['loads'] else 0:.3f}")
+            print(f"   - Final time: {execution_history['times'][-1] if execution_history['times'] else 0:.3f}")
+            print(f"   - Total distance: {execution_history['distances'][-1] if execution_history['distances'] else 0:.3f}")
+        else:
+            print("✅ Solution is feasible (no constraint violations)")
+            print(f"📊 Execution Summary:")
+            print(f"   - Total steps: {len(execution_history['nodes']) - 1}")
+            print(f"   - Route segments: {len(execution_history['route_segments'])}")
+            print(f"   - Final load: {execution_history['loads'][-1] if execution_history['loads'] else 0:.3f}")
+            print(f"   - Final time: {execution_history['times'][-1] if execution_history['times'] else 0:.3f}")
+            print(f"   - Total distance: {execution_history['distances'][-1] if execution_history['distances'] else 0:.3f}")
+        
+        # 如果有真实路径，也可视化对比
+        if gt_path is not None and len(gt_path) > 0:
+            gt_filename = f'gt_route_{model_info}_{split}_batch{batch_idx}.png'
+            gt_save_path = os.path.join(vis_path, gt_filename)
+            
+            fig_gt, _ = visualize_vrp_solution(
+                points=points,
+                tour=gt_path,
+                points_with_features=current_features,
+                problem_type=problem_type,
+                pred_cost=gt_cost,
+                save_path=gt_save_path,
+                title_suffix="Ground Truth",
+                show_constraints=True,
+                figsize=(15, 10)
+            )
+            plt.close(fig_gt)
+            
+            # 创建对比图
+            comparison_filename = f'comparison_{model_info}_{pomo_info}_temp{test_temp}_{split}_batch{batch_idx}.png'
+            comparison_save_path = os.path.join(vis_path, comparison_filename)
+            
+            fig_comp, axes = plt.subplots(1, 2, figsize=(20, 8))
+            
+            # 左侧：真实路径
+            ax1 = axes[0]
+            ax1.scatter(points[:, 0], points[:, 1], c='lightblue', s=100, marker='o', 
+                       edgecolors='blue', linewidths=1, zorder=3)
+            if problem_type != "TSP":
+                ax1.scatter(points[0, 0], points[0, 1], c='red', s=200, marker='s', 
+                           label='Depot', edgecolors='black', linewidths=2, zorder=5)
+            
+            for i in range(len(gt_path)):
+                start = points[gt_path[i]]
+                end = points[gt_path[(i + 1) % len(gt_path)]]
+                ax1.plot([start[0], end[0]], [start[1], end[1]], 'r-', linewidth=2)
+            
+            ax1.set_title(f'Ground Truth (Cost: {gt_cost:.2f})', fontsize=14, fontweight='bold')
+            ax1.set_xlabel('X Coordinate')
+            ax1.set_ylabel('Y Coordinate')
+            ax1.grid(True, alpha=0.3)
+            ax1.set_aspect('equal', adjustable='box')
+            
+            # 右侧：预测路径
+            ax2 = axes[1]
+            ax2.scatter(points[:, 0], points[:, 1], c='lightblue', s=100, marker='o', 
+                       edgecolors='blue', linewidths=1, zorder=3)
+            if problem_type != "TSP":
+                ax2.scatter(points[0, 0], points[0, 1], c='red', s=200, marker='s', 
+                           label='Depot', edgecolors='black', linewidths=2, zorder=5)
+            
+            for i in range(len(pred_path)):
+                start = points[pred_path[i]]
+                end = points[pred_path[(i + 1) % len(pred_path)]]
+                ax2.plot([start[0], end[0]], [start[1], end[1]], 'g-', linewidth=2)
+            
+            gap = ((best_solved_cost - gt_cost) / gt_cost * 100) if gt_cost > 0 else 0
+            feasible_status = "feasible" if violations['total_violations'] == 0 else f"infeasible({violations['total_violations']})"
+            ax2.set_title(f'Prediction (Cost: {best_solved_cost:.2f}, Gap: {gap:.1f}%) {feasible_status}', 
+                         fontsize=14, fontweight='bold')
+            ax2.set_xlabel('X Coordinate')
+            ax2.set_ylabel('Y Coordinate')
+            ax2.grid(True, alpha=0.3)
+            ax2.set_aspect('equal', adjustable='box')
+            
+            plt.tight_layout()
+            plt.savefig(comparison_save_path, dpi=300, bbox_inches='tight')
+            plt.close(fig_comp)
+            
+            print(f"Comparison visualization saved to: {comparison_save_path}")
+            
+    except Exception as e:
+        print(f"VRP可视化失败: {e}")
+        # 回退到简单可视化
+        plt.rcParams['font.sans-serif'] = ['SimHei']  # 用来正常显示中文标签
+        plt.rcParams['axes.unicode_minus'] = False  # 用来正常显示负号
+        
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
+        
+        # 绘制真实路径
+        ax1.scatter(points[:, 0], points[:, 1], c='blue', s=50)
+        for i in range(len(gt_path)):
+            start = points[gt_path[i]]
+            end = points[gt_path[(i + 1) % len(gt_path)]]
+            ax1.plot([start[0], end[0]], [start[1], end[1]], 'r-')
+        ax1.set_title(f'真实路径 (成本: {gt_cost:.2f})')
+        
+        # 绘制预测路径
+        ax2.scatter(points[:, 0], points[:, 1], c='blue', s=50)
+        for i in range(len(pred_path)):
+            start = points[pred_path[i]]
+            end = points[pred_path[(i + 1) % len(pred_path)]]
+            ax2.plot([start[0], end[0]], [start[1], end[1]], 'g-')
+        ax2.set_title(f'预测路径 (成本: {best_solved_cost:.2f})')
+        
+        fallback_filename = f'fallback_route_comparison_{model_info}_{pomo_info}_temp{test_temp}_{split}_batch{batch_idx}.png'
+        plt.savefig(os.path.join(vis_path, fallback_filename))
+        plt.close(fig)
+
 
 
 class HybridBatchSampler(torch.utils.data.BatchSampler):
@@ -803,7 +1139,7 @@ def visualize_vrp_solution(points, tour, points_with_features=None, problem_type
 
 
 def greedy_solver_batch_pomo(adj_matrix_batch, points_with_features, temperature=1.0, problem_type="TSP", add_prior=False, 
-                             test_mode=False, distance_matrices=None, current_epoch=None, max_epochs=None, debug=False):
+                            test_mode=False, distance_matrices=None, debug=False):
     """
     POMO版本的批量TSP/VRP求解器 - 同时从多个起始点求解以获得更好的解
     
@@ -875,8 +1211,7 @@ def greedy_solver_batch_pomo(adj_matrix_batch, points_with_features, temperature
         print(f"================================\n")
     
     if add_prior:
-        adj_matrix_batch = enhance_adjacency_matrix(adj_matrix_batch, distance_matrices=distance_matrices, connectivity_boost=0.5,
-                                                   current_epoch=current_epoch, max_epochs=max_epochs)
+        adj_matrix_batch = enhance_adjacency_matrix(adj_matrix_batch, distance_matrices=distance_matrices)
 
     batch_size, num_nodes, _ = adj_matrix_batch.shape
     device = adj_matrix_batch.device
@@ -1071,10 +1406,35 @@ def greedy_solver_batch_pomo(adj_matrix_batch, points_with_features, temperature
                     depot_coords = expanded_coords[:, 0, :]  # depot坐标
                     return_distances = torch.sqrt(torch.sum((expanded_coords - depot_coords.unsqueeze(1)) ** 2, dim=-1))
                     
-                    # 对于非depot节点，需要额外的返回距离
-                    is_depot = torch.arange(num_nodes, device=device).unsqueeze(0).expand(total_tours, -1) == 0
+                    # 修复：正确处理当前位置和目标位置的关系
+                    # 当前位置是否为depot
+                    current_at_depot = (current_nodes == 0).unsqueeze(1)  # (total_tours, 1)
+                    # 目标节点是否为depot
+                    target_is_depot = torch.arange(num_nodes, device=device).unsqueeze(0).expand(total_tours, -1) == 0  # (total_tours, num_nodes)
+                    
+                    # 计算总距离：
+                    # 情况1：当前在depot，目标是depot -> 距离为0
+                    # 情况2：当前在depot，目标不是depot -> 距离为current_to_target + target_to_depot
+                    # 情况3：当前不在depot，目标是depot -> 距离为current_to_target
+                    # 情况4：当前不在depot，目标不是depot -> 距离为current_to_target + target_to_depot
+                    
                     total_distances = distances.clone()
-                    total_distances[~is_depot] += return_distances[~is_depot]
+                    
+                    # 情况1：当前在depot，目标是depot -> 距离为0
+                    current_and_target_depot = current_at_depot & target_is_depot
+                    total_distances[current_and_target_depot] = 0.0
+                    
+                    # 情况2：当前在depot，目标不是depot -> 距离为current_to_target + target_to_depot
+                    current_depot_target_not = current_at_depot & ~target_is_depot
+                    total_distances[current_depot_target_not] = distances[current_depot_target_not] + return_distances[current_depot_target_not]
+                    
+                    # 情况3：当前不在depot，目标是depot -> 距离为current_to_target（已经在distances中）
+                    current_not_target_depot = ~current_at_depot & target_is_depot
+                    # total_distances[current_not_target_depot] = distances[current_not_target_depot]  # 默认已经是这个值
+                    
+                    # 情况4：当前不在depot，目标不是depot -> 距离为current_to_target + target_to_depot
+                    current_not_target_not = ~current_at_depot & ~target_is_depot
+                    total_distances[current_not_target_not] = distances[current_not_target_not] + return_distances[current_not_target_not]
                     
                     length_violations = remaining_lengths.unsqueeze(1) - round_error_epsilon < total_distances
                 
@@ -1082,7 +1442,26 @@ def greedy_solver_batch_pomo(adj_matrix_batch, points_with_features, temperature
         
         # 开放路径特殊处理：确保depot始终可达以避免死锁
         if attribute_o:
-            ninf_mask[:, 0] = 0.0  # depot永远可达
+            # 修复：不能简单地让depot永远可达，这会覆盖必要的约束
+            # 只有在特定情况下才允许depot可达：
+            # 1. 当前不在depot（需要返回depot的选项）
+            # 2. 当前在depot但所有客户已访问（路径已完成）
+            
+            at_depot = (current_nodes == 0)
+            all_customers_visited = customer_visited_mask.all(dim=1)
+            
+            # 情况1：当前不在depot - 允许返回depot
+            not_at_depot = ~at_depot
+            ninf_mask[not_at_depot, 0] = 0.0
+            
+            # 情况2：当前在depot且所有客户已访问 - 允许留在depot（路径完成）
+            depot_and_done = at_depot & all_customers_visited
+            ninf_mask[depot_and_done, 0] = 0.0
+            
+            # 关键修复：当前在depot且有客户未访问时，不允许留在depot
+            # 这个约束不应该被覆盖（之前在第1032行已经设置过）
+            depot_and_not_done = at_depot & ~all_customers_visited
+            ninf_mask[depot_and_not_done, 0] = float('-inf')  # 确保约束不被覆盖
             # 但如果当前在depot且所有客户已访问，则这些路径已完成
             # 不需要额外处理，因为已通过finished_tours跟踪
         
@@ -1627,96 +2006,6 @@ def greedy_solver_batch_pomo(adj_matrix_batch, points_with_features, temperature
     
     return tours, log_probs
 
-
-def greedy_tsp_solver_batch_pomo(adj_matrix_batch, temperature=1.0):
-    """
-    POMO版本的批量TSP求解器，同时从所有节点作为起始点进行求解，支持探索
-    Args:
-        adj_matrix_batch: torch.Tensor of shape (batch_size, num_nodes, num_nodes) - 邻接矩阵批次
-        temperature: float - 控制探索程度的温度参数，越大越随机，越小越贪婪 (默认1.0)
-    Returns:
-        tours: torch.Tensor of shape (batch_size * num_nodes, num_nodes + 1) - 所有路径
-        log_probs: torch.Tensor of shape (batch_size * num_nodes,) - 每个路径的对数概率
-    """
-    batch_size, num_nodes, _ = adj_matrix_batch.shape
-    device = adj_matrix_batch.device
-    
-    # 扩展维度：为每个样本的每个节点作为起始点创建副本
-    # 从 (batch_size, num_nodes, num_nodes) 扩展为 (batch_size * num_nodes, num_nodes, num_nodes)
-    expanded_adj = adj_matrix_batch.unsqueeze(1).expand(-1, num_nodes, -1, -1)
-    expanded_adj = expanded_adj.reshape(batch_size * num_nodes, num_nodes, num_nodes)
-    
-    # 创建起始节点索引：[0,1,2,...,num_nodes-1, 0,1,2,...,num_nodes-1, ...]
-    start_nodes = torch.arange(num_nodes, device=device).repeat(batch_size)  # shape: (batch_size * num_nodes,)
-    
-    # 初始化路径
-    tours = torch.zeros(batch_size * num_nodes, num_nodes + 1, dtype=torch.long, device=device)
-    tours[:, 0] = start_nodes  # 设置起始节点
-    
-    # 当前节点位置
-    current_nodes = start_nodes.clone()
-    
-    # 累积对数概率
-    log_probs = torch.zeros(batch_size * num_nodes, device=device)
-    
-    # 初始化访问掩码（使用非原地操作的方式）
-    visited_mask = torch.zeros(batch_size * num_nodes, num_nodes, dtype=torch.bool, device=device)
-    # 使用非原地方式标记起始节点
-    start_mask = torch.zeros_like(visited_mask)
-    start_mask.scatter_(1, start_nodes.unsqueeze(1), True)
-    visited_mask = visited_mask | start_mask
-    
-    # 迭代构建路径
-    for step in range(num_nodes - 1):
-        # 获取当前节点到所有节点的边权重
-        batch_indices = torch.arange(batch_size * num_nodes, device=device)
-        current_edges = expanded_adj[batch_indices, current_nodes]  # shape: (batch_size * num_nodes, num_nodes)
-        
-        # 应用访问掩码：已访问节点设为负无穷
-        masked_edges = torch.where(visited_mask, 
-                                 torch.tensor(-float('inf'), device=device), 
-                                 current_edges)
-        
-        # 根据温度参数控制探索程度
-        if temperature <= 0.0:
-            # 温度为0或负数时使用纯贪婪选择
-            edge_probs = F.softmax(masked_edges, dim=-1)  # shape: (batch_size * num_nodes, num_nodes)
-            next_nodes = torch.argmax(masked_edges, dim=-1)  # shape: (batch_size * num_nodes,)
-        else:
-            # 使用温度参数调整logits以控制探索程度
-            scaled_logits = masked_edges / temperature
-            
-            # 计算概率分布
-            edge_probs = F.softmax(scaled_logits, dim=-1)  # shape: (batch_size * num_nodes, num_nodes)
-            
-            # 根据概率分布进行多项式采样，引入探索
-            next_nodes = torch.multinomial(edge_probs, num_samples=1).squeeze(-1)  # shape: (batch_size * num_nodes,)
-        
-        # 记录选择的对数概率
-        selected_probs = edge_probs.gather(1, next_nodes.unsqueeze(1)).squeeze(1)
-        log_probs += torch.log(selected_probs + 1e-8)
-        
-        # 更新路径
-        tours[:, step + 1] = next_nodes
-        
-        # 使用非原地操作更新访问掩码
-        next_mask = torch.zeros_like(visited_mask)
-        next_mask.scatter_(1, next_nodes.unsqueeze(1), True)
-        visited_mask = visited_mask | next_mask
-        
-        # 更新当前节点
-        current_nodes = next_nodes
-    
-    # 添加回到起始节点的路径
-    tours[:, -1] = start_nodes
-    
-    # 计算回到起始节点的对数概率
-    return_edges = expanded_adj[batch_indices, current_nodes, start_nodes]
-    log_probs += torch.log(return_edges + 1e-8)
-    
-    return tours, log_probs
-
-
 def calculate_euclidean_distance_batch(points_batch):
     """
     批量计算欧几里得距离矩阵
@@ -1770,7 +2059,7 @@ def calculate_tour_cost_batch_pomo(tours, distance_matrices, problem_type="TSP")
     costs = torch.zeros(total_tours, device=device)
     
     # 使用张量操作计算所有路径段的成本
-    for i in range(tours.shape[1] - 1):  # num_nodes + 1 - 1 = num_nodes 个路径段
+    for i in range(tours.shape[1] - 1):   
         current_nodes = tours[:, i]      # shape: (total_tours,)
         next_nodes = tours[:, i + 1]     # shape: (total_tours,)
         
@@ -1780,7 +2069,6 @@ def calculate_tour_cost_batch_pomo(tours, distance_matrices, problem_type="TSP")
         
         # 对于开放路径（O属性），如果下一个节点是depot（通常是节点0），则距离设为0
         if attribute_o:
-            # 根据VRPEnv.py中的逻辑：segment_lengths[self.selected_node_list.roll(dims=2, shifts=-1)==0] = 0
             # 这意味着返回depot的路径段成本为0
             is_return_to_depot = (next_nodes == 0)
             segment_costs[is_return_to_depot] = 0
@@ -1799,8 +2087,7 @@ def calculate_tour_cost_batch(tours, distance_matrices):
     Returns:
         costs: torch.Tensor of shape (batch_size,)
     """
-    batch_size = len(tours)
-    device = distance_matrices.device
+    batch_size = len(tours) 
     costs = []
     
     for b in range(batch_size):
@@ -1912,20 +2199,46 @@ class TSPModel(COMetaModel):
       self.default_problem_type = primary_type
       
     elif self.problem_type != "TSP":
-      self.train_dataset = VRPGraphDataset(
-          data_file=os.path.join(self.args.storage_path, self.args.training_split),
-          sparse_factor=self.args.sparse_factor
-      )
+      # 检查是否启用单案例模式
+      if getattr(self.args, 'single_case_mode', False):
+        print(f"启用单案例模式：问题类型 {self.problem_type}")
+        print(f"将从 {self.args.training_split} 加载第一个案例并复制 {self.args.single_case_copies} 份")
+        
+        # 使用单案例数据集
+        self.train_dataset = SingleCaseVRPGraphDataset(
+            data_file=os.path.join(self.args.storage_path, self.args.training_split),
+            sparse_factor=self.args.sparse_factor,
+            num_copies=self.args.single_case_copies
+        )
+        
+        # 测试和验证数据集也使用单案例（可以用较少的副本）
+        self.test_dataset = SingleCaseVRPGraphDataset(
+            data_file=os.path.join(self.args.storage_path, self.args.test_split),
+            sparse_factor=self.args.sparse_factor,
+            num_copies=max(100, self.args.single_case_copies // 10)  # 测试集使用更少的副本
+        )
 
-      self.test_dataset = VRPGraphDataset(
-          data_file=os.path.join(self.args.storage_path, self.args.test_split),
-          sparse_factor=self.args.sparse_factor,
-      )
+        self.validation_dataset = SingleCaseVRPGraphDataset(
+            data_file=os.path.join(self.args.storage_path, self.args.validation_split),
+            sparse_factor=self.args.sparse_factor,
+            num_copies=max(50, self.args.single_case_copies // 20)  # 验证集使用更少的副本
+        )
+      else:
+        # 正常的多案例模式
+        self.train_dataset = VRPGraphDataset(
+            data_file=os.path.join(self.args.storage_path, self.args.training_split),
+            sparse_factor=self.args.sparse_factor
+        )
 
-      self.validation_dataset = VRPGraphDataset(
-          data_file=os.path.join(self.args.storage_path, self.args.validation_split),
-          sparse_factor=self.args.sparse_factor,
-      )
+        self.test_dataset = VRPGraphDataset(
+            data_file=os.path.join(self.args.storage_path, self.args.test_split),
+            sparse_factor=self.args.sparse_factor,
+        )
+
+        self.validation_dataset = VRPGraphDataset(
+            data_file=os.path.join(self.args.storage_path, self.args.validation_split),
+            sparse_factor=self.args.sparse_factor,
+        )
 
     else:   # origin: TSP
       self.train_dataset = TSPGraphDataset(
@@ -1937,8 +2250,6 @@ class TSPModel(COMetaModel):
           data_file=os.path.join(self.args.storage_path, self.args.test_split),
           sparse_factor=self.args.sparse_factor,
       )
-      if self.args.test_debug:
-        self.test_dataset.file_lines = self.test_dataset.file_lines[:1000]  # debug 使用
 
       self.validation_dataset = TSPGraphDataset(
           data_file=os.path.join(self.args.storage_path, self.args.validation_split),
@@ -1969,6 +2280,14 @@ class TSPModel(COMetaModel):
     print(f"数值稳定性配置: max_logit={self.max_logit_value}, min_prob={self.min_prob_value}, max_advantage={self.max_advantage}")
     print(f"调试模式: rl_debug={self.rl_debug} {'(将输出详细诊断信息)' if self.rl_debug else ''}")
     print(f"测试调试: test_debug={self.test_debug} {'(测试时输出诊断信息)' if self.test_debug else ''}")
+    
+    # 新增排序损失相关参数
+    self.ranking_loss_weight = getattr(self.args, 'ranking_loss_weight', 10)  # 排序损失权重
+    self.ranking_loss_type = getattr(self.args, 'ranking_loss_type', 'listwise')  # 排序损失类型
+    self.edge_importance_method = getattr(self.args, 'edge_importance_method', 'optimal_tour')  # 边重要性定义方法
+    
+    if self.ranking_loss_weight > 0:
+        print(f"启用排序损失: weight={self.ranking_loss_weight}, type={self.ranking_loss_type}, method={self.edge_importance_method}")
 
   def forward(self, x, adj, t, edge_index):
     return self.model(x, t, adj, edge_index)
@@ -2248,8 +2567,7 @@ class TSPModel(COMetaModel):
     
     # 记录当前批次的问题类型（使用hash以便在tensorboard中显示）
     problem_type_hash = hash(current_problem_type) % 1000
-    self.log("train/problem_type", problem_type_hash, on_step=True, on_epoch=False)
-    # self.log("train/problem_type_name", current_problem_type, on_step=False, on_epoch=True)  # 注释掉，因为不能记录字符串
+    self.log("train/problem_type", problem_type_hash, on_step=True, on_epoch=False) 
     
     # 验证数据形状的一致性
     batch_size = points.shape[0]
@@ -2283,18 +2601,13 @@ class TSPModel(COMetaModel):
     loss_func = nn.CrossEntropyLoss()
     ce_loss = loss_func(x0_pred, adj_matrix.long())
     
-    # 强化学习辅助损失计算
-    rl_loss = torch.tensor(0.0, device=points.device)
+    # 新增：排序损失计算
+    ranking_loss = torch.tensor(0.0, device=points.device)
     
-    # 更新条件检查，包含新的安全控制参数
-    compute_rl = (self.rl_loss_weight > 0 and 
-                  not self.sparse and 
-                  batch_idx % self.rl_compute_frequency == 0)
-    
-    if compute_rl:  # 暂时只支持非稀疏图
+    # 计算排序损失
+    if self.ranking_loss_weight > 0:
         try:
-            # 获取预测的邻接矩阵概率 - 添加数值稳定性检查
-            # 首先检查x0_pred的数值范围
+            # 获取预测的邻接矩阵概率
             if torch.isnan(x0_pred).any() or torch.isinf(x0_pred).any():
                 raise ValueError("x0_pred包含nan或inf")
             
@@ -2311,133 +2624,96 @@ class TSPModel(COMetaModel):
             # 取边存在的概率 (第二个类别)
             adj_prob_matrix = x0_pred_prob[:, :, :, 1]  # shape: (batch_size, num_nodes, num_nodes)
             
-            # 确保概率矩阵在有效范围内
-            adj_prob_matrix = torch.clamp(adj_prob_matrix, min=self.min_prob_value, max=1.0 - self.min_prob_value)
-            
             # 计算真实距离矩阵
             distance_matrices = calculate_euclidean_distance_batch(points[:, :, :2])
             
-            # 检查距离矩阵的有效性
-            if torch.isnan(distance_matrices).any() or torch.isinf(distance_matrices).any():
-                raise ValueError("distance_matrices包含nan或inf")
+            # 计算边的重要性得分
+            edge_importance = self.compute_edge_importance(points, gt_tour, distance_matrices, current_problem_type)
             
-            # 使用POMO版本的求解器获取路径和对数概率，支持探索
-            pred_tours, log_probs = greedy_solver_batch_pomo(adj_prob_matrix, temperature=self.pomo_temperature, 
-                points_with_features=points, problem_type=current_problem_type,
-                add_prior=self.add_prior, distance_matrices=distance_matrices, test_mode=False,
-                current_epoch=self.current_epoch, max_epochs=self.trainer.max_epochs if self.trainer else None,
-                debug=self.rl_debug)  # 使用实例属性
+            # 计算排序损失
+            ranking_loss = self.compute_ranking_loss(adj_prob_matrix, edge_importance)
             
-            # 检查求解器输出的有效性
-            if log_probs is None or torch.isnan(log_probs).any() or torch.isinf(log_probs).any():
-                raise ValueError("求解器返回的log_probs无效")
+            # 记录排序损失相关指标
+            self.log("train/ranking_loss", ranking_loss)
+            self.log("train/ranking_loss_weight", self.ranking_loss_weight)
             
-            # 计算预测路径的成本
-            pred_costs = calculate_tour_cost_batch_pomo(pred_tours, distance_matrices, problem_type=current_problem_type)   
+            # 计算边重要性统计
+            optimal_edges = (edge_importance > 0.5).float().sum(dim=(1, 2)).mean()
+            self.log("train/avg_optimal_edges", optimal_edges)
             
-            # 检查成本计算的有效性
-            if torch.isnan(pred_costs).any() or torch.isinf(pred_costs).any():
-                raise ValueError("pred_costs包含nan或inf")
-            
-            # 计算真实最优路径的成本作为基准
-            gt_tours_list = []
-            for b in range(points.shape[0]):
-                gt_tour_b = gt_tour[b].cpu().numpy().tolist()
-                gt_tour_b.append(gt_tour_b[0])  # 添加回到起点
-                gt_tours_list.append(gt_tour_b)
-            
-            gt_costs = calculate_tour_cost_batch(gt_tours_list, distance_matrices)
-            
-            # 检查真实成本的有效性
-            if torch.isnan(gt_costs).any() or torch.isinf(gt_costs).any() or (gt_costs <= 0).any():
-                raise ValueError("gt_costs包含无效值")
-            
-            # 将gt_costs扩展以匹配POMO的维度
-            if current_problem_type == "TSP":
-                num_starts = points.shape[1] 
-            else:
-                num_starts = points.shape[1] - 1
-            gt_costs_expanded = gt_costs.unsqueeze(1).expand(-1, num_starts).reshape(-1)
-            
-            # 计算奖励 (负的相对成本差异) - 添加数值保护
-            cost_diff = pred_costs - gt_costs_expanded
-            relative_cost_diff = cost_diff / (gt_costs_expanded + self.min_prob_value)
-            
-            # 限制相对成本差异的范围以防止极端值
-            relative_cost_diff = torch.clamp(relative_cost_diff, min=-10.0, max=10.0)
-            rewards = -relative_cost_diff  # 成本越低，奖励越高
-            
-            # 检查奖励的有效性
-            if torch.isnan(rewards).any() or torch.isinf(rewards).any():
-                raise ValueError("rewards包含nan或inf")
-            
-            # 对于POMO，我们选择每个样本中最好的路径来计算基线
-            rewards_reshaped = rewards.reshape(points.shape[0], num_starts)  # (batch_size, num_starts)
-            best_rewards = torch.max(rewards_reshaped, dim=1)[0]  # (batch_size,)
-            
-            # 更新基线 (使用指数移动平均) - 添加数值保护
-            current_baseline = best_rewards.mean().detach()
-            if torch.isnan(current_baseline) or torch.isinf(current_baseline):
-                current_baseline = self.rl_baseline if self.rl_baseline is not None else torch.tensor(0.0)
-            
-            if self.rl_baseline is None:
-                self.rl_baseline = current_baseline
-            else:
-                self.rl_baseline = self.rl_baseline_decay * self.rl_baseline + (1 - self.rl_baseline_decay) * current_baseline
-            
-            # 确保基线值有效
-            if torch.isnan(self.rl_baseline) or torch.isinf(self.rl_baseline):
-                self.rl_baseline = torch.tensor(0.0)
-            
-            # 计算优势函数 (奖励减去基线)
-            advantages = rewards - self.rl_baseline
-            
-            # 限制优势函数的范围
-            advantages = torch.clamp(advantages, min=-self.max_advantage, max=self.max_advantage)
-            
-            # REINFORCE损失 (负的对数概率乘以优势) - 最终数值保护
-            rl_loss_raw = -(log_probs * advantages.detach()).mean()
-            
-            if torch.isnan(rl_loss_raw) or torch.isinf(rl_loss_raw):
-                raise ValueError("rl_loss_raw无效")
-            
-            rl_loss = rl_loss_raw
-            
-            # 重置失败计数（成功计算）
-            self.rl_failure_count = 0
-            
-            # 记录强化学习相关指标
-            self.log("train/rl_loss", rl_loss)
-            self.log("train/avg_reward", rewards.mean())
-            self.log("train/best_reward", best_rewards.mean())
-            self.log("train/baseline", self.rl_baseline)
-            self.log("train/avg_pred_cost", pred_costs.mean())
-            self.log("train/best_pred_cost", pred_costs.reshape(points.shape[0], num_starts).min(dim=1)[0].mean())
-            self.log("train/avg_gt_cost", gt_costs.mean())
-            self.log("train/cost_gap_percent", (relative_cost_diff * 100).mean())
-            self.log("train/best_cost_gap_percent", ((pred_costs.reshape(points.shape[0], num_starts).min(dim=1)[0] - gt_costs) / (gt_costs + 1e-8) * 100).mean())
-            self.log("train/pomo_temperature", self.pomo_temperature)
-            self.log("train/rl_failure_count", float(self.rl_failure_count))
+            # 计算预测概率与重要性的相关性
+            if len(adj_prob_matrix.view(-1)) > 1 and len(edge_importance.view(-1)) > 1:
+                # 移除自连接后计算相关性
+                batch_size, num_nodes, _ = adj_prob_matrix.shape
+                correlation_sum = 0.0
+                valid_batches = 0
+                
+                for b in range(batch_size):
+                    pred_flat = adj_prob_matrix[b].view(-1)
+                    importance_flat = edge_importance[b].view(-1)
+                    
+                    # 移除自连接
+                    non_diag_mask = ~torch.eye(num_nodes, dtype=torch.bool, device=points.device).view(-1)
+                    pred_flat = pred_flat[non_diag_mask]
+                    importance_flat = importance_flat[non_diag_mask]
+                    
+                    if len(pred_flat) > 1:
+                        pred_mean = pred_flat.mean()
+                        importance_mean = importance_flat.mean()
+                        
+                        pred_centered = pred_flat - pred_mean
+                        importance_centered = importance_flat - importance_mean
+                        
+                        numerator = (pred_centered * importance_centered).sum()
+                        denominator = torch.sqrt((pred_centered ** 2).sum() * (importance_centered ** 2).sum())
+                        
+                        if denominator > 1e-8:
+                            correlation = numerator / denominator
+                            correlation_sum += correlation.item()
+                            valid_batches += 1
+                
+                if valid_batches > 0:
+                    avg_correlation = correlation_sum / valid_batches
+                    self.log("train/pred_importance_correlation", avg_correlation)
             
         except Exception as e:
-            # 增加失败计数
-            self.rl_failure_count += 1
-            error_msg = f"强化学习损失计算失败 ({self.rl_failure_count}): {e}"
-            
             if self.rl_skip_on_error:
-                print(f"WARNING: {error_msg}")
-                rl_loss = torch.tensor(0.0, device=points.device)
-                
-                # 记录失败信息
-                self.log("train/rl_failure_count", float(self.rl_failure_count))
+                print(f"WARNING: 排序损失计算失败: {e}")
+                ranking_loss = torch.tensor(0.0, device=points.device)
             else:
-                # 不跳过错误，重新抛出异常
-                raise RuntimeError(error_msg)
-        
-        # 移除之前的重复代码块，因为我们现在统一在try-except中处理
+                raise RuntimeError(f"排序损失计算失败: {e}")
     
-    # 总损失 = 交叉熵损失 + 强化学习损失
-    total_loss = ce_loss + self.rl_loss_weight * rl_loss
+    # 更新条件检查，包含新的安全控制参数
+    compute_rl = (self.rl_loss_weight > 0 and 
+                  not self.sparse and 
+                  batch_idx % self.rl_compute_frequency == 0)
+    
+    if compute_rl:  # 暂时只支持非稀疏图
+        # 使用封装的强化学习损失计算方法
+        rl_loss, rl_metrics = self.compute_reinforcement_learning_loss(
+            x0_pred, points, gt_tour, current_problem_type, batch_idx
+        )
+        # region 保存所有相关变量以便调试 
+        import pickle
+        debug_data = {
+            'x0_pred': x0_pred,
+            'points': points, 
+            'gt_tour': gt_tour,
+            'current_problem_type': current_problem_type,
+            'batch_idx': batch_idx,
+            'adj_matrix': adj_matrix,
+        }
+        with open("rl_debug.pkl", "wb") as f:
+            pickle.dump(debug_data, f)
+        # endregion
+        # 记录强化学习相关指标
+        self._log_rl_metrics(rl_metrics)
+        
+    else:
+        rl_loss = torch.tensor(0.0, device=points.device)
+    
+    # 总损失 = 交叉熵损失 + 强化学习损失 + 排序损失
+    total_loss = ce_loss + self.rl_loss_weight * rl_loss + self.ranking_loss_weight * ranking_loss
     
     # 记录核心损失和指标
     self.log("train/ce_loss", ce_loss, on_step=True, on_epoch=True)
@@ -2451,19 +2727,6 @@ class TSPModel(COMetaModel):
     # 记录扩散时间步信息
     avg_t = np.mean(np.random.randint(1, self.diffusion.T + 1, points.shape[0]).astype(int))
     self.log("train/avg_diffusion_timestep", avg_t, on_step=True, on_epoch=True, sync_dist=True)
-    
-    # 记录动态connectivity_boost值
-    if self.add_prior and self.current_epoch is not None and self.trainer and self.trainer.max_epochs:
-        # 计算当前的动态boost值（使用与enhance_adjacency_matrix相同的逻辑）
-        epoch_ratio = self.current_epoch / self.trainer.max_epochs
-        decay_rate = 3.0
-        initial_boost = 0.1  # 默认初始值
-        dynamic_boost = initial_boost * torch.exp(torch.tensor(-decay_rate * epoch_ratio))
-        min_boost = initial_boost * 0.01
-        dynamic_boost = max(dynamic_boost.item(), min_boost)
-        
-        self.log("train/connectivity_boost", dynamic_boost, on_step=True, on_epoch=True, sync_dist=True)
-        self.log("train/boost_decay_ratio", epoch_ratio, on_step=True, on_epoch=True, sync_dist=True)
     
     return total_loss
 
@@ -2676,8 +2939,7 @@ class TSPModel(COMetaModel):
                                                 problem_type=current_problem_type,
                                                 add_prior=self.add_prior,
                                                 test_mode=True,
-                                                distance_matrices=distance_matrices,
-                                                current_epoch=None, max_epochs=None,  # 测试阶段不需要epoch信息
+                                                distance_matrices=distance_matrices, 
                                                 debug=self.test_debug  # 新增测试调试开关
                                                 )
       # pred_tours: (1 * num_nodes, num_nodes + 1) for TSP or (1 * (num_nodes-1), num_nodes + 1) for VRP
@@ -2814,361 +3076,470 @@ class TSPModel(COMetaModel):
       print(f"总样本数: {len(self.train_dataset)}")
       print(f"批次大小: {self.args.batch_size}\n")
 
-
-def enhance_adjacency_matrix(adj_matrix, min_prob=0.01, connectivity_boost=0.9, distance_matrices=None, current_epoch=None, max_epochs=None):
-    """
-    增强邻接矩阵的连通性，主要通过实际几何距离先验来改善低质量热力图
-    
-    当扩散模型训练初期输出的热力图质量较差时，这个函数可以：
-    1. 确保所有边都有最小概率，避免完全断连
-    2. 基于实际几何距离增强近邻连接的概率（距离先验）
-    3. 提高求解器找到完整路径的成功率
-    4. 随着训练进行，逐步减少对启发式信息的依赖
-    
-    Args:
-        adj_matrix: torch.Tensor of shape (batch_size, num_nodes, num_nodes) - 原始邻接概率矩阵
-        min_prob: float - 所有边的最小概率值，防止完全为0的边
-        connectivity_boost: float - 基于距离的连通性增强系数（初始值）
-        distance_matrices: torch.Tensor of shape (batch_size, num_nodes, num_nodes) - 距离矩阵，用于计算节点间实际距离
-        current_epoch: int - 当前训练epoch（可选）
-        max_epochs: int - 最大训练epoch数（可选）
-    
-    Returns:
-        enhanced_matrix: torch.Tensor - 增强后的邻接矩阵
-    """
-    enhanced = adj_matrix.clone()
-    
-    # 步骤1: 确保最小概率，避免求解器遇到完全不可达的节点
-    enhanced = torch.clamp(enhanced, min=min_prob)
-    
-    # 步骤2: 动态调整connectivity_boost参数
-    dynamic_boost = connectivity_boost
-    if current_epoch is not None and max_epochs is not None and max_epochs > 0:
-        # 使用指数衰减策略：boost = initial_boost * exp(-decay_rate * epoch_ratio)
-        # 这样可以在初期保持较高值，然后逐步减小
-        epoch_ratio = current_epoch / max_epochs
-        decay_rate = 2.0  # 衰减率，可以调整这个值来控制衰减速度
-        dynamic_boost = connectivity_boost * torch.exp(torch.tensor(-decay_rate * epoch_ratio))
+  def compute_edge_importance(self, points, gt_tour, distance_matrices, problem_type="TSP"):
+        """
+        计算边的重要性得分，用于排序损失
         
-        # 设置最小值，避免完全消失
-        min_boost = connectivity_boost * 0.01  # 保留初始值的1%作为最小值
-        dynamic_boost = max(dynamic_boost.item(), min_boost)
+        Args:
+            points: torch.Tensor of shape (batch_size, num_nodes, feature_dim)
+            gt_tour: torch.Tensor of shape (batch_size, num_nodes)
+            distance_matrices: torch.Tensor of shape (batch_size, num_nodes, num_nodes)
+            problem_type: str - 问题类型
         
-        # 添加调试信息（可选）
-        # if current_epoch % 10 == 0:  # 每10个epoch输出一次
-        #     print(f"[Epoch {current_epoch}/{max_epochs}] Connectivity boost: {connectivity_boost:.4f} → {dynamic_boost:.4f} (ratio: {epoch_ratio:.3f})")
+        Returns:
+            edge_importance: torch.Tensor of shape (batch_size, num_nodes, num_nodes)
+                每条边的重要性得分，得分越高表示边越重要
+        """
+        batch_size, num_nodes, _ = distance_matrices.shape
+        device = points.device
         
-        # 可选：使用线性衰减策略（注释掉指数衰减，取消注释这部分来使用）
-        # dynamic_boost = connectivity_boost * (1 - epoch_ratio)
+        # 初始化边重要性矩阵
+        edge_importance = torch.zeros(batch_size, num_nodes, num_nodes, device=device)
         
-        # 可选：使用余弦退火策略（注释掉指数衰减，取消注释这部分来使用）
-        # import math
-        # dynamic_boost = connectivity_boost * (1 + math.cos(math.pi * epoch_ratio)) / 2
-    
-    # 步骤3: 基于实际几何距离的先验增强
-    if distance_matrices is not None:
-        batch_size, num_nodes, _ = enhanced.shape
-        device = enhanced.device
+        if self.edge_importance_method == 'optimal_tour':
+            # 方法1：基于最优解中的边
+            for b in range(batch_size):
+                tour = gt_tour[b]
+                # 移除填充值
+                valid_tour = tour[tour >= 0]
+                
+                if len(valid_tour) > 1:
+                    # 最优解中的边得分为1.0
+                    for i in range(len(valid_tour)):
+                        curr_node = valid_tour[i]
+                        next_node = valid_tour[(i + 1) % len(valid_tour)]
+                        edge_importance[b, curr_node, next_node] = 1.0
+                        # 对于TSP，边是双向的
+                        if problem_type == "TSP":
+                            edge_importance[b, next_node, curr_node] = 1.0
         
-        # 确保distance_matrices在同一设备上
-        if distance_matrices.device != device:
-            distance_matrices = distance_matrices.to(device)
-        
-        # 计算距离权重：距离越小，权重越大
-        # 使用负指数函数将距离转换为权重: exp(-distance/scale)
-        # 这样可以确保近距离节点获得更高的权重
-        
-        # 首先计算距离的统计信息以确定合适的缩放因子
-        # 排除对角线元素（自己到自己的距离为0）
-        mask = torch.eye(num_nodes, device=device).bool().unsqueeze(0).expand(batch_size, -1, -1)
-        masked_distances = distance_matrices.masked_select(~mask)
-        
-        # 使用距离的中位数或平均值作为缩放因子
-        distance_scale = masked_distances.median().item()
-        if distance_scale == 0:
-            distance_scale = 1.0  # 防止除零
-        
-        # 计算基于距离的权重
-        # 使用负指数函数：exp(-distance/scale)
-        distance_weights = torch.exp(-distance_matrices / distance_scale)
-        
-        # 将对角线元素设为0（节点到自己的增强权重为0）
-        diagonal_mask = torch.eye(num_nodes, device=device).bool().unsqueeze(0).expand(batch_size, -1, -1)
-        distance_weights[diagonal_mask] = 0
-        
-        # 应用动态调整后的距离权重增强
-        enhanced = (1-dynamic_boost) * enhanced + dynamic_boost * distance_weights
-        
-    else:
-        # 如果没有提供距离矩阵，回退到原来的索引距离方式
-        # 但这种情况应该避免，因为索引距离的假设通常不准确
-        print("警告：没有提供距离矩阵，回退到索引距离启发式")
-        batch_size, num_nodes, _ = enhanced.shape
-        
-        for b in range(batch_size):
-            for i in range(num_nodes):
-                for j in range(num_nodes):
-                    if i != j:
-                        # 计算节点索引距离的倒数作为先验权重
-                        # 索引距离越小，增强越多（假设索引相近的节点空间距离也相近）
-                        index_distance_factor = 1.0 / (abs(i - j) + 1)
-                        enhanced[b, i, j] += dynamic_boost * index_distance_factor
-    
-    # 步骤4: 归一化到合理范围，避免概率过大
-    enhanced = torch.clamp(enhanced, min=0, max=1)
-    
-    return enhanced
-
-
-def calculate_tour_cost_batch_single(tours, distance_matrices, problem_type="TSP"):
-    """
-    非POMO版本的批量路径成本计算，支持开放路径，每个样本只有一个路径
-    Args:
-        tours: torch.Tensor of shape (batch_size, max_tour_length) - 路径张量
-        distance_matrices: torch.Tensor of shape (batch_size, num_nodes, num_nodes) - 距离矩阵
-        problem_type: str - 问题类型，用于确定是否为开放路径
-    Returns:
-        costs: torch.Tensor of shape (batch_size,) - 每个路径的成本
-    """
-    batch_size, _ = tours.shape
-    device = tours.device
-    
-    # 确定是否为开放路径
-    attribute_o = 'O' in problem_type and problem_type.startswith('O')
-    
-    # 计算路径成本
-    costs = torch.zeros(batch_size, device=device)
-    
-    # 使用张量操作计算所有路径段的成本
-    for i in range(tours.shape[1] - 1):  # max_tour_length - 1 个路径段
-        current_nodes = tours[:, i]      # shape: (batch_size,)
-        next_nodes = tours[:, i + 1]     # shape: (batch_size,)
-        
-        # 跳过填充的部分（值为-1或0的无效段）
-        valid_segments = (current_nodes >= 0) & (next_nodes >= 0) & (current_nodes != next_nodes)
-        
-        if valid_segments.any():
-            # 获取对应的距离
-            batch_indices = torch.arange(batch_size, device=device)
-            segment_costs = distance_matrices[batch_indices, current_nodes, next_nodes]
+        elif self.edge_importance_method == 'distance_based':
+            # 方法2：基于距离的重要性（距离越短越重要）
+            # 使用softmax将距离转换为重要性得分
+            max_distance = distance_matrices.max(dim=-1, keepdim=True)[0].max(dim=-2, keepdim=True)[0]
+            normalized_distances = distance_matrices / (max_distance + 1e-8)
+            # 距离越短，重要性越高
+            edge_importance = torch.exp(-normalized_distances * 3.0)  # 3.0是调节参数
             
-            # 对于开放路径（O属性），如果下一个节点是depot（通常是节点0），则距离设为0
-            if attribute_o:
-                is_return_to_depot = (next_nodes == 0)
-                segment_costs[is_return_to_depot] = 0
+            # 自连接的重要性设为0
+            for b in range(batch_size):
+                for i in range(num_nodes):
+                    edge_importance[b, i, i] = 0.0
+        
+        elif self.edge_importance_method == 'combined':
+            # 方法3：结合最优解和距离信息
+            # 最优解中的边基础得分
+            for b in range(batch_size):
+                tour = gt_tour[b]
+                valid_tour = tour[tour >= 0]
+                
+                if len(valid_tour) > 1:
+                    for i in range(len(valid_tour)):
+                        curr_node = valid_tour[i]
+                        next_node = valid_tour[(i + 1) % len(valid_tour)]
+                        edge_importance[b, curr_node, next_node] = 2.0  # 最优解中的边得分更高
+                        if problem_type == "TSP":
+                            edge_importance[b, next_node, curr_node] = 2.0
             
-            # 只累加有效路径段的成本
-            costs[valid_segments] += segment_costs[valid_segments]
-    
-    return costs
+            # 加上基于距离的得分
+            max_distance = distance_matrices.max(dim=-1, keepdim=True)[0].max(dim=-2, keepdim=True)[0]
+            normalized_distances = distance_matrices / (max_distance + 1e-8)
+            distance_importance = torch.exp(-normalized_distances * 2.0)
+            
+            # 自连接的重要性设为0
+            for b in range(batch_size):
+                for i in range(num_nodes):
+                    distance_importance[b, i, i] = 0.0
+            
+            edge_importance = edge_importance + distance_importance
+        
+        return edge_importance
+
+  def compute_ranking_loss(self, pred_adj_matrix, edge_importance, mask=None):
+        """
+        计算排序损失，确保预测的连接矩阵反映边的相对重要性
+        
+        Args:
+            pred_adj_matrix: torch.Tensor of shape (batch_size, num_nodes, num_nodes)
+                预测的连接矩阵（概率值）
+            edge_importance: torch.Tensor of shape (batch_size, num_nodes, num_nodes)
+                边的重要性得分
+            mask: torch.Tensor of shape (batch_size, num_nodes, num_nodes), optional
+                掩码，用于忽略某些边
+        
+        Returns:
+            ranking_loss: torch.Tensor - 排序损失值
+        """
+        batch_size, num_nodes, _ = pred_adj_matrix.shape
+        device = pred_adj_matrix.device
+        
+        if self.ranking_loss_type == 'listwise':
+            # ListNet损失：逐行优化排序
+            ranking_loss = 0.0
+            valid_rows = 0
+            
+            for b in range(batch_size):
+                for i in range(num_nodes):
+                    # 获取第i行（从节点i出发的所有边）
+                    pred_row = pred_adj_matrix[b, i, :]  # (num_nodes,)
+                    importance_row = edge_importance[b, i, :]  # (num_nodes,)
+                    
+                    # 移除自连接（对角线元素）
+                    non_self_mask = torch.arange(num_nodes, device=device) != i
+                    pred_row = pred_row[non_self_mask]
+                    importance_row = importance_row[non_self_mask]
+                    
+                    # 应用额外的掩码
+                    if mask is not None:
+                        mask_row = mask[b, i, :][non_self_mask]
+                        pred_row = pred_row[mask_row]
+                        importance_row = importance_row[mask_row]
+                    
+                    # 计算这一行的ListNet损失
+                    if len(pred_row) > 1:
+                        # 预测的概率分布（这一行的softmax）
+                        pred_prob = F.softmax(pred_row, dim=0)
+                        # 真实的概率分布（基于重要性的softmax）
+                        target_prob = F.softmax(importance_row, dim=0)
+                        
+                        # KL散度作为ListNet损失
+                        kl_loss = F.kl_div(torch.log(pred_prob + 1e-8), target_prob, reduction='sum')
+                        ranking_loss += kl_loss
+                        valid_rows += 1
+            
+            # 按有效行数平均
+            if valid_rows > 0:
+                ranking_loss = ranking_loss / valid_rows
+            
+        elif self.ranking_loss_type == 'pairwise':
+            # 成对损失：逐行比较
+            ranking_loss = 0.0
+            total_pairs = 0
+            margin = 1.0
+            
+            for b in range(batch_size):
+                for i in range(num_nodes):
+                    # 获取第i行
+                    pred_row = pred_adj_matrix[b, i, :]
+                    importance_row = edge_importance[b, i, :]
+                    
+                    # 移除自连接
+                    non_self_mask = torch.arange(num_nodes, device=device) != i
+                    pred_row = pred_row[non_self_mask]
+                    importance_row = importance_row[non_self_mask]
+                    
+                    # 应用额外的掩码
+                    if mask is not None:
+                        mask_row = mask[b, i, :][non_self_mask]
+                        pred_row = pred_row[mask_row]
+                        importance_row = importance_row[mask_row]
+                    
+                    # 成对比较这一行内的所有边
+                    n_edges = len(pred_row)
+                    if n_edges > 1:
+                        for j in range(n_edges):
+                            for k in range(j + 1, n_edges):
+                                # 如果边j比边k重要，那么预测值也应该更高
+                                if importance_row[j] > importance_row[k]:
+                                    diff = pred_row[j] - pred_row[k]
+                                    loss = torch.clamp(margin - diff, min=0.0)
+                                    ranking_loss += loss
+                                elif importance_row[k] > importance_row[j]:
+                                    diff = pred_row[k] - pred_row[j]
+                                    loss = torch.clamp(margin - diff, min=0.0)
+                                    ranking_loss += loss
+                                total_pairs += 1
+            
+            # 按总对数平均
+            if total_pairs > 0:
+                ranking_loss = ranking_loss / total_pairs
+                
+        elif self.ranking_loss_type == 'spearman':
+            # Spearman相关系数损失：逐行计算
+            ranking_loss = 0.0
+            valid_rows = 0
+            
+            for b in range(batch_size):
+                for i in range(num_nodes):
+                    # 获取第i行
+                    pred_row = pred_adj_matrix[b, i, :]
+                    importance_row = edge_importance[b, i, :]
+                    
+                    # 移除自连接
+                    non_self_mask = torch.arange(num_nodes, device=device) != i
+                    pred_row = pred_row[non_self_mask]
+                    importance_row = importance_row[non_self_mask]
+                    
+                    # 应用额外的掩码
+                    if mask is not None:
+                        mask_row = mask[b, i, :][non_self_mask]
+                        pred_row = pred_row[mask_row]
+                        importance_row = importance_row[mask_row]
+                    
+                    # 计算Spearman相关系数
+                    if len(pred_row) > 1:
+                        pred_rank = torch.argsort(torch.argsort(pred_row, descending=True), descending=False).float()
+                        importance_rank = torch.argsort(torch.argsort(importance_row, descending=True), descending=False).float()
+                        
+                        # 计算相关系数
+                        pred_mean = pred_rank.mean()
+                        importance_mean = importance_rank.mean()
+                        
+                        numerator = ((pred_rank - pred_mean) * (importance_rank - importance_mean)).sum()
+                        pred_std = torch.sqrt(((pred_rank - pred_mean) ** 2).sum())
+                        importance_std = torch.sqrt(((importance_rank - importance_mean) ** 2).sum())
+                        
+                        if pred_std > 0 and importance_std > 0:
+                            correlation = numerator / (pred_std * importance_std)
+                            # 转换为损失（1 - correlation，因为我们希望最大化相关性）
+                            ranking_loss += (1.0 - correlation)
+                            valid_rows += 1
+            
+            # 按有效行数平均
+            if valid_rows > 0:
+                ranking_loss = ranking_loss / valid_rows
+        
+        else:
+            raise ValueError(f"不支持的排序损失类型: {self.ranking_loss_type}")
+        
+        return ranking_loss
 
 
-def debug_visualize_route_comparison(
-    points_with_features,
-    np_points,
-    np_gt_tour,
-    solved_tours,
-    gt_cost,
-    best_solved_cost,
-    split,
-    batch_idx,
-    problem_type,
-    trainer=None,
-    logger=None,
-    args=None,
-    enable_debug=False
-):
+  def compute_reinforcement_learning_loss(self, x0_pred, points, gt_tour, current_problem_type, batch_idx):
     """
-    调试模式的路径可视化对比函数
+    计算强化学习损失函数
     
     Args:
-        points_with_features: 包含特征的点数据
-        np_points: 点的坐标数据，shape: (num_nodes, 2)
-        np_gt_tour: 真实路径，shape: (num_nodes,)
-        solved_tours: 预测路径列表
-        gt_cost: 真实路径成本
-        best_solved_cost: 预测路径成本
-        split: 数据集分割（train/val/test）
-        batch_idx: 批次索引
-        problem_type: 问题类型
-        trainer: 训练器对象
-        logger: 日志记录器
-        args: 参数对象
-        enable_debug: 是否启用调试模式
-    """
-    if not enable_debug:
-        return
-    
-    # 直接使用已经从batch中获取的特征数据
-    # points_with_features 已经在前面从 points_tensor 获得，包含了正确的特征维度
-    current_features = points_with_features.cpu().numpy()[0] if points_with_features is not None else None
-    
-    # 获取路径数据
-    points = np_points[:, :2]  # shape: (num_nodes, 2) 
-    gt_path = np_gt_tour  # shape: (num_nodes,)
-    pred_path = solved_tours[0]  # shape: (num_nodes,)
-    
-    # 确定保存路径
-    if trainer is not None and hasattr(trainer, 'ckpt_path') and trainer.ckpt_path is not None:
-        ckpt_path = trainer.ckpt_path
-        exp_save_dir = os.path.dirname(os.path.dirname(ckpt_path))
-    else:
-        exp_save_dir = logger.log_dir if logger and hasattr(logger, 'log_dir') and logger.log_dir else './logs'
+        x0_pred: torch.Tensor - 扩散模型的预测输出 (batch_size, 2, num_nodes, num_nodes)
+        points: torch.Tensor - 节点坐标特征 (batch_size, num_nodes, feature_dim)
+        gt_tour: torch.Tensor - 真实最优路径 (batch_size, num_nodes)
+        current_problem_type: str - 当前问题类型 ("TSP", "CVRP"等)
+        batch_idx: int - 当前批次索引
         
-    vis_path = os.path.join(exp_save_dir, 'route_visualization')
-    os.makedirs(vis_path, exist_ok=True)
-    
-    # 构建文件名信息
-    model_info = f"v{getattr(logger, 'version', 'unknown')}_{getattr(logger, 'name', 'model')}"
-    use_pomo = getattr(args, 'use_pomo', True) if args else True
-    pomo_info = "pomo" if use_pomo else "greedy"
-    test_temp = getattr(args, 'test_temperature', 0.0) if args else 0.0
-    
-    # 可视化预测路径
-    pred_filename = f'pred_route_{model_info}_{pomo_info}_temp{test_temp}_{split}_batch{batch_idx}.png'
-    pred_save_path = os.path.join(vis_path, pred_filename)
-    
-    title_suffix = f"{pomo_info.upper()}, temp={test_temp}"
+    Returns:
+        tuple: (rl_loss, metrics_dict)
+            - rl_loss: torch.Tensor - 强化学习损失值
+            - metrics_dict: dict - 包含各种指标的字典
+    """
+    device = points.device
     
     try:
-        fig_pred, execution_history = visualize_vrp_solution(
-            points=points,
-            tour=pred_path,
-            points_with_features=current_features,
-            problem_type=problem_type,
-            gt_cost=gt_cost,
-            pred_cost=best_solved_cost,
-            save_path=pred_save_path,
-            title_suffix=title_suffix,
-            show_constraints=True,
-            figsize=(15, 10)
+        # 第一步：输入验证和预处理
+        if torch.isnan(x0_pred).any() or torch.isinf(x0_pred).any():
+            raise ValueError("x0_pred包含nan或inf")
+        
+        # 限制x0_pred的范围以防止softmax溢出
+        x0_pred_clamped = torch.clamp(x0_pred, min=-self.max_logit_value, max=self.max_logit_value)
+        
+        # 计算softmax概率
+        x0_pred_prob = x0_pred_clamped.permute((0, 2, 3, 1)).contiguous().softmax(dim=-1)
+        
+        if torch.isnan(x0_pred_prob).any() or torch.isinf(x0_pred_prob).any():
+            raise ValueError("x0_pred_prob包含nan或inf")
+        
+        # 取边存在的概率 (第二个类别)
+        adj_prob_matrix = x0_pred_prob[:, :, :, 1]  # shape: (batch_size, num_nodes, num_nodes)
+        
+        # 确保概率矩阵在有效范围内
+        adj_prob_matrix = torch.clamp(adj_prob_matrix, min=self.min_prob_value, max=1.0 - self.min_prob_value)
+        
+        # 第二步：计算距离矩阵
+        distance_matrices = calculate_euclidean_distance_batch(points[:, :, :2])
+        
+        if torch.isnan(distance_matrices).any() or torch.isinf(distance_matrices).any():
+            raise ValueError("distance_matrices包含nan或inf")
+        
+        # 第三步：使用POMO求解器生成路径
+        pred_tours, log_probs = greedy_solver_batch_pomo(
+            adj_prob_matrix, 
+            temperature=self.pomo_temperature, 
+            points_with_features=points, 
+            problem_type=current_problem_type,
+            add_prior=self.add_prior, 
+            distance_matrices=distance_matrices, 
+            test_mode=False,
+            current_epoch=self.current_epoch, 
+            max_epochs=self.trainer.max_epochs if self.trainer else None,
+            debug=self.rl_debug
         )
-        plt.close(fig_pred)  # 关闭图形以释放内存
         
-        # 从execution_history中获取约束违反信息
-        violations = execution_history['constraint_violations']
+        if log_probs is None or torch.isnan(log_probs).any() or torch.isinf(log_probs).any():
+            raise ValueError("求解器返回的log_probs无效")
         
-        # 记录约束违反信息
-        if violations['total_violations'] > 0:
-            print(f"⚠️  Solution has {violations['total_violations']} constraint violations:")
-            if violations['capacity_violations'] > 0:
-                print(f"   - Capacity violations: {violations['capacity_violations']}")
-            if violations['time_window_violations'] > 0:
-                print(f"   - Time window violations: {violations['time_window_violations']}")
-            if violations['length_violations'] > 0:
-                print(f"   - Length violations: {violations['length_violations']}")
-            
-            # 记录详细的违反信息
-            print(f"📊 Execution Summary:")
-            print(f"   - Total steps: {len(execution_history['nodes']) - 1}")
-            print(f"   - Route segments: {len(execution_history['route_segments'])}")
-            print(f"   - Final load: {execution_history['loads'][-1] if execution_history['loads'] else 0:.3f}")
-            print(f"   - Final time: {execution_history['times'][-1] if execution_history['times'] else 0:.3f}")
-            print(f"   - Total distance: {execution_history['distances'][-1] if execution_history['distances'] else 0:.3f}")
-        else:
-            print("✅ Solution is feasible (no constraint violations)")
-            print(f"📊 Execution Summary:")
-            print(f"   - Total steps: {len(execution_history['nodes']) - 1}")
-            print(f"   - Route segments: {len(execution_history['route_segments'])}")
-            print(f"   - Final load: {execution_history['loads'][-1] if execution_history['loads'] else 0:.3f}")
-            print(f"   - Final time: {execution_history['times'][-1] if execution_history['times'] else 0:.3f}")
-            print(f"   - Total distance: {execution_history['distances'][-1] if execution_history['distances'] else 0:.3f}")
+        # 第四步：计算预测路径成本
+        pred_costs = calculate_tour_cost_batch_pomo(pred_tours, distance_matrices, problem_type=current_problem_type)
         
-        # 如果有真实路径，也可视化对比
-        if gt_path is not None and len(gt_path) > 0:
-            gt_filename = f'gt_route_{model_info}_{split}_batch{batch_idx}.png'
-            gt_save_path = os.path.join(vis_path, gt_filename)
-            
-            fig_gt, _ = visualize_vrp_solution(
-                points=points,
-                tour=gt_path,
-                points_with_features=current_features,
-                problem_type=problem_type,
-                pred_cost=gt_cost,
-                save_path=gt_save_path,
-                title_suffix="Ground Truth",
-                show_constraints=True,
-                figsize=(15, 10)
-            )
-            plt.close(fig_gt)
-            
-            # 创建对比图
-            comparison_filename = f'comparison_{model_info}_{pomo_info}_temp{test_temp}_{split}_batch{batch_idx}.png'
-            comparison_save_path = os.path.join(vis_path, comparison_filename)
-            
-            fig_comp, axes = plt.subplots(1, 2, figsize=(20, 8))
-            
-            # 左侧：真实路径
-            ax1 = axes[0]
-            ax1.scatter(points[:, 0], points[:, 1], c='lightblue', s=100, marker='o', 
-                       edgecolors='blue', linewidths=1, zorder=3)
-            if problem_type != "TSP":
-                ax1.scatter(points[0, 0], points[0, 1], c='red', s=200, marker='s', 
-                           label='Depot', edgecolors='black', linewidths=2, zorder=5)
-            
-            for i in range(len(gt_path)):
-                start = points[gt_path[i]]
-                end = points[gt_path[(i + 1) % len(gt_path)]]
-                ax1.plot([start[0], end[0]], [start[1], end[1]], 'r-', linewidth=2)
-            
-            ax1.set_title(f'Ground Truth (Cost: {gt_cost:.2f})', fontsize=14, fontweight='bold')
-            ax1.set_xlabel('X Coordinate')
-            ax1.set_ylabel('Y Coordinate')
-            ax1.grid(True, alpha=0.3)
-            ax1.set_aspect('equal', adjustable='box')
-            
-            # 右侧：预测路径
-            ax2 = axes[1]
-            ax2.scatter(points[:, 0], points[:, 1], c='lightblue', s=100, marker='o', 
-                       edgecolors='blue', linewidths=1, zorder=3)
-            if problem_type != "TSP":
-                ax2.scatter(points[0, 0], points[0, 1], c='red', s=200, marker='s', 
-                           label='Depot', edgecolors='black', linewidths=2, zorder=5)
-            
-            for i in range(len(pred_path)):
-                start = points[pred_path[i]]
-                end = points[pred_path[(i + 1) % len(pred_path)]]
-                ax2.plot([start[0], end[0]], [start[1], end[1]], 'g-', linewidth=2)
-            
-            gap = ((best_solved_cost - gt_cost) / gt_cost * 100) if gt_cost > 0 else 0
-            feasible_status = "feasible" if violations['total_violations'] == 0 else f"infeasible({violations['total_violations']})"
-            ax2.set_title(f'Prediction (Cost: {best_solved_cost:.2f}, Gap: {gap:.1f}%) {feasible_status}', 
-                         fontsize=14, fontweight='bold')
-            ax2.set_xlabel('X Coordinate')
-            ax2.set_ylabel('Y Coordinate')
-            ax2.grid(True, alpha=0.3)
-            ax2.set_aspect('equal', adjustable='box')
-            
-            plt.tight_layout()
-            plt.savefig(comparison_save_path, dpi=300, bbox_inches='tight')
-            plt.close(fig_comp)
-            
-            print(f"Comparison visualization saved to: {comparison_save_path}")
-            
+        if torch.isnan(pred_costs).any() or torch.isinf(pred_costs).any():
+            raise ValueError("pred_costs包含nan或inf")
+        
+        # 第五步：计算真实最优路径成本
+        gt_costs = self._compute_ground_truth_costs(gt_tour, distance_matrices)
+        
+        if torch.isnan(gt_costs).any() or torch.isinf(gt_costs).any() or (gt_costs <= 0).any():
+            raise ValueError("gt_costs包含无效值")
+        
+        # 第六步：计算奖励和优势
+        rewards, advantages = self._compute_rewards_and_advantages(
+            pred_costs, gt_costs, points.shape[0], current_problem_type
+        )
+        
+        if torch.isnan(rewards).any() or torch.isinf(rewards).any():
+            raise ValueError("rewards包含nan或inf")
+        
+        # 第七步：计算REINFORCE损失
+        rl_loss_raw = -(log_probs * advantages.detach()).mean()
+        
+        if torch.isnan(rl_loss_raw) or torch.isinf(rl_loss_raw):
+            raise ValueError("rl_loss_raw无效")
+        
+        rl_loss = rl_loss_raw
+        
+        # 重置失败计数（成功计算）
+        self.rl_failure_count = 0
+        
+        # 第八步：计算指标
+        metrics = self._compute_rl_metrics(
+            rl_loss, rewards, pred_costs, gt_costs, current_problem_type, points.shape[0]
+        )
+        
+        return rl_loss, metrics
+        
     except Exception as e:
-        print(f"VRP可视化失败: {e}")
-        # 回退到简单可视化
-        plt.rcParams['font.sans-serif'] = ['SimHei']  # 用来正常显示中文标签
-        plt.rcParams['axes.unicode_minus'] = False  # 用来正常显示负号
+        # 错误处理
+        return self._handle_rl_computation_error(e, device)
+    
+  def _compute_ground_truth_costs(self, gt_tour, distance_matrices):
+    """计算真实最优路径的成本"""
+    gt_tours_list = []
+    for b in range(gt_tour.shape[0]):
+        gt_tour_b = gt_tour[b].cpu().numpy().tolist()
+        gt_tour_b.append(gt_tour_b[0])  # 添加回到起点
+        gt_tours_list.append(gt_tour_b)
+    
+    gt_costs = calculate_tour_cost_batch(gt_tours_list, distance_matrices)
+    return gt_costs
+    
+  def _compute_rewards_and_advantages(self, pred_costs, gt_costs, batch_size, current_problem_type):
+    """计算奖励和优势函数"""
+    # 扩展gt_costs以匹配POMO维度
+    if current_problem_type == "TSP":
+        num_starts = pred_costs.shape[0] // batch_size  # 推断num_starts
+    else:
+        num_starts = pred_costs.shape[0] // batch_size
+    
+    gt_costs_expanded = gt_costs.unsqueeze(1).expand(-1, num_starts).reshape(-1)
+    
+    # 计算奖励 (负的相对成本差异)
+    cost_diff = pred_costs - gt_costs_expanded
+    relative_cost_diff = cost_diff / (gt_costs_expanded + self.min_prob_value)
+    
+    # 限制相对成本差异的范围以防止极端值
+    relative_cost_diff = torch.clamp(relative_cost_diff, min=-10.0, max=10.0)
+    rewards = -relative_cost_diff  # 成本越低，奖励越高
+    
+    # 对于POMO，选择每个样本中最好的路径来计算基线
+    rewards_reshaped = rewards.reshape(batch_size, num_starts)  # (batch_size, num_starts)
+    best_rewards = torch.max(rewards_reshaped, dim=1)[0]  # (batch_size,)
+    
+    # 更新基线 (使用指数移动平均)
+    current_baseline = best_rewards.mean().detach()
+    if torch.isnan(current_baseline) or torch.isinf(current_baseline):
+        current_baseline = self.rl_baseline if self.rl_baseline is not None else torch.tensor(0.0)
+    
+    if self.rl_baseline is None:
+        self.rl_baseline = current_baseline
+    else:
+        self.rl_baseline = self.rl_baseline_decay * self.rl_baseline + (1 - self.rl_baseline_decay) * current_baseline
+    
+    # 确保基线值有效
+    if torch.isnan(self.rl_baseline) or torch.isinf(self.rl_baseline):
+        self.rl_baseline = torch.tensor(0.0)
+    
+    # 计算优势函数 (奖励减去基线)
+    advantages = rewards - self.rl_baseline
+    
+    # 限制优势函数的范围
+    advantages = torch.clamp(advantages, min=-self.max_advantage, max=self.max_advantage)
+    
+    return rewards, advantages
+    
+  def _compute_rl_metrics(self, rl_loss, rewards, pred_costs, gt_costs, current_problem_type, batch_size):
+    """计算并返回强化学习相关指标"""
+    # 推断POMO的起始点数量
+    if current_problem_type == "TSP":
+        num_starts = pred_costs.shape[0] // batch_size
+    else:
+        num_starts = pred_costs.shape[0] // batch_size
+    
+    # 重新计算相对成本差异用于指标
+    gt_costs_expanded = gt_costs.unsqueeze(1).expand(-1, num_starts).reshape(-1)
+    relative_cost_diff = (pred_costs - gt_costs_expanded) / (gt_costs_expanded + 1e-8)
+    
+    # 计算最佳成本
+    pred_costs_reshaped = pred_costs.reshape(batch_size, num_starts)
+    best_pred_costs = pred_costs_reshaped.min(dim=1)[0]
+    
+    # 计算各种指标
+    best_rewards = rewards.reshape(batch_size, num_starts).max(dim=1)[0]
+    
+    metrics = {
+        'rl_loss': rl_loss.item(),
+        'avg_reward': rewards.mean().item(),
+        'best_reward': best_rewards.mean().item(),
+        'baseline': self.rl_baseline.item() if self.rl_baseline is not None else 0.0,
+        'avg_pred_cost': pred_costs.mean().item(),
+        'best_pred_cost': best_pred_costs.mean().item(),
+        'avg_gt_cost': gt_costs.mean().item(),
+        'cost_gap_percent': (relative_cost_diff * 100).mean().item(),
+        'best_cost_gap_percent': ((best_pred_costs - gt_costs) / (gt_costs + 1e-8) * 100).mean().item(),
+        'pomo_temperature': self.pomo_temperature,
+        'rl_failure_count': float(self.rl_failure_count)
+    }
+    
+    return metrics
+    
+  def _handle_rl_computation_error(self, error, device):
+    """处理强化学习计算错误"""
+    self.rl_failure_count += 1
+    error_msg = f"强化学习损失计算失败 ({self.rl_failure_count}): {error}"
+    
+    if self.rl_skip_on_error:
+        print(f"WARNING: {error_msg}")
+        rl_loss = torch.tensor(0.0, device=device)
         
-        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
+        # 返回基本指标
+        metrics = {
+            'rl_loss': 0.0,
+            'avg_reward': 0.0,
+            'best_reward': 0.0,
+            'baseline': 0.0,
+            'avg_pred_cost': 0.0,
+            'best_pred_cost': 0.0,
+            'avg_gt_cost': 0.0,
+            'cost_gap_percent': 0.0,
+            'best_cost_gap_percent': 0.0,
+            'pomo_temperature': self.pomo_temperature,
+            'rl_failure_count': float(self.rl_failure_count)
+        }
         
-        # 绘制真实路径
-        ax1.scatter(points[:, 0], points[:, 1], c='blue', s=50)
-        for i in range(len(gt_path)):
-            start = points[gt_path[i]]
-            end = points[gt_path[(i + 1) % len(gt_path)]]
-            ax1.plot([start[0], end[0]], [start[1], end[1]], 'r-')
-        ax1.set_title(f'真实路径 (成本: {gt_cost:.2f})')
-        
-        # 绘制预测路径
-        ax2.scatter(points[:, 0], points[:, 1], c='blue', s=50)
-        for i in range(len(pred_path)):
-            start = points[pred_path[i]]
-            end = points[pred_path[(i + 1) % len(pred_path)]]
-            ax2.plot([start[0], end[0]], [start[1], end[1]], 'g-')
-        ax2.set_title(f'预测路径 (成本: {best_solved_cost:.2f})')
-        
-        fallback_filename = f'fallback_route_comparison_{model_info}_{pomo_info}_temp{test_temp}_{split}_batch{batch_idx}.png'
-        plt.savefig(os.path.join(vis_path, fallback_filename))
-        plt.close(fig)
+        return rl_loss, metrics
+    else:
+        # 不跳过错误，重新抛出异常
+        raise RuntimeError(error_msg)
+    
+  def _log_rl_metrics(self, metrics):
+    """记录强化学习指标到日志"""
+    self.log("train/rl_loss", metrics['rl_loss'])
+    self.log("train/avg_reward", metrics['avg_reward'])
+    self.log("train/best_reward", metrics['best_reward'])
+    self.log("train/baseline", metrics['baseline'])
+    self.log("train/avg_pred_cost", metrics['avg_pred_cost'])
+    self.log("train/best_pred_cost", metrics['best_pred_cost'])
+    self.log("train/avg_gt_cost", metrics['avg_gt_cost'])
+    self.log("train/cost_gap_percent", metrics['cost_gap_percent'])
+    self.log("train/best_cost_gap_percent", metrics['best_cost_gap_percent'])
+    self.log("train/pomo_temperature", metrics['pomo_temperature'])
+    self.log("train/rl_failure_count", metrics['rl_failure_count'])
+
+  def forward(self, x, adj, t, edge_index):
+    return self.model(x, t, adj, edge_index)
