@@ -1,0 +1,4 @@
+---
+alwaysApply: true
+---
+the conda environment is always setted as difusco_basic_py39
